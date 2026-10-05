@@ -42,6 +42,14 @@ pub fn init() {
     }
 }
 
+/// Begins the subtransaction one of the surveyor's own reads runs in. Rolled back, it keeps what
+/// the surveyor measured and drew inside it: the read counts the pages it read.
+pub(crate) unsafe fn begin_own_read() {
+    OWN_READ.set(true);
+    pg_sys::BeginInternalSubTransaction(std::ptr::null());
+    OWN_READ.set(false);
+}
+
 /// How deep the statements being planned are nested: 0 outside the planner, where nothing is kept.
 /// A planning that did not enter through the planner's hook counts as one while the surveyor's
 /// hooks run for it (`budget`), and keeps what they measure until its top level is planned.
@@ -63,6 +71,7 @@ fn outermost() -> bool {
 /// Forgets everything kept for the round, or for a planning outside one.
 pub(crate) fn forget_all() {
     crate::leaves::forget();
+    crate::closure::forget_from(0);
     crate::size::forget_from(0);
     crate::budget::forget();
 }
@@ -83,6 +92,7 @@ impl Round {
 impl Drop for Round {
     fn drop(&mut self) {
         crate::size::forget_from(depth());
+        crate::closure::forget_from(depth());
         DEPTH.set(DEPTH.get().saturating_sub(1));
         if outermost() {
             forget_all();
@@ -143,6 +153,7 @@ unsafe extern "C-unwind" fn plan(
 /// leaves, its WITH queries' reads and its relations' conditions measured, and its budget.
 struct Kept {
     leaves: crate::leaves::Saved,
+    closure: crate::closure::Saved,
     size: crate::size::Saved,
     budget: crate::budget::Saved,
 }
@@ -151,6 +162,7 @@ impl Kept {
     fn now() -> Kept {
         Kept {
             leaves: crate::leaves::saved(),
+            closure: crate::closure::saved(),
             size: crate::size::saved(),
             budget: crate::budget::saved(),
         }
@@ -158,6 +170,7 @@ impl Kept {
 
     fn restore(self) {
         crate::leaves::put_back(self.leaves);
+        crate::closure::put_back(self.closure);
         crate::size::put_back(self.size);
         crate::budget::put_back(self.budget);
     }

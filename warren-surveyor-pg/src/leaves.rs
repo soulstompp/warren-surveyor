@@ -36,6 +36,25 @@
 //! through subqueries and WITH queries as it is, its distinct values are the same count, and
 //! nothing else is said of it; where ANALYZE counted the column from every row, its count.
 //!
+//! PostgreSQL keeps none for a column of a WITH RECURSIVE query either. Where the query was read
+//! while planning (`closure`) and the statement equates that column with another relation's, the
+//! values the read returned stand for its statistics: each value with its share of the rows, the
+//! largest first, the distinct values, and the share of NULLs. The column a table's B-tree leads
+//! with that the statement equates with such a column, where its values are more than the
+//! statistics target, is measured at each of the read's values, one descent of the B-tree each,
+//! and those values are listed among its most common values with their measured shares. The join is
+//! then sized from the rows each value meets. The share ANALYZE's most common values give a value
+//! stands only where it is the better count: where that ANALYZE read every row of the table
+//! (`query::every_row_analyzed`), and the value is not measured; or where the value lies inside one
+//! leaf or two that the descent cannot reach within its pages, and its measure is set aside. A
+//! value inside one leaf or two that the descent reaches is counted on those leaves. The shares of
+//! ANALYZE's that stand stay as they are; where the measured shares would pass what they and the
+//! NULLs leave, the measured shares are scaled to fit it, and where the values listed are every
+//! value between the first and the last, scaled to fill it. These descents stop once their pages
+//! would pass the pages of the table, or what is left of the statistics' half of the statement's
+//! planning-read budget, and a value they did not reach keeps what ANALYZE gave it, or is left
+//! unlisted.
+//!
 //! A table read with its inheritance children or its partitions is handed its members' counts
 //! added place by place, for rows add over places: the share of NULLs, the most common values
 //! where every member counts every value it holds, and the distinct values the members hold
@@ -55,6 +74,7 @@
 //! rows) is read whole, every entry on every one of its leaves counted; past them, it keeps the
 //! count from its own leaves.
 
+use crate::closure;
 use crate::measure::{self, End};
 use crate::query::{cells, every_row_analyzed, members, surveyed, surveyor_am};
 use crate::round;
@@ -71,6 +91,17 @@ static mut NEXT_INDEX: pg_sys::get_index_stats_hook_type = None;
 thread_local! {
     /// What each B-tree measured in this round of planning.
     static KEPT: RefCell<Vec<(pg_sys::Oid, Option<Vectors>)>> = const { RefCell::new(Vec::new()) };
+    /// What each B-tree measured in this round at the values of WITH queries read while planning.
+    static AT_VALUES: RefCell<Vec<AtValues>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What a B-tree measured at the values of WITH queries read while planning: the pages those
+/// descents read, and each value with its measure, none where it was not reached.
+#[derive(Clone)]
+struct AtValues {
+    index: pg_sys::Oid,
+    pages: u32,
+    measured: Vec<(i64, Option<measure::Measured>)>,
 }
 
 /// Puts the hooks in place, after any hooks already there.
@@ -86,19 +117,24 @@ pub fn init() {
 /// Forgets what was measured in the round.
 pub(crate) fn forget() {
     KEPT.with(|k| k.borrow_mut().clear());
+    AT_VALUES.with(|k| k.borrow_mut().clear());
 }
 
 /// What was measured in the round so far, to be put back by `put_back`.
-pub(crate) struct Saved(Vec<(pg_sys::Oid, Option<Vectors>)>);
+pub(crate) struct Saved(Vec<(pg_sys::Oid, Option<Vectors>)>, Vec<AtValues>);
 
 /// What was measured in the round so far.
 pub(crate) fn saved() -> Saved {
-    Saved(KEPT.with(|k| k.borrow().clone()))
+    Saved(
+        KEPT.with(|k| k.borrow().clone()),
+        AT_VALUES.with(|k| k.borrow().clone()),
+    )
 }
 
 /// Puts back what `saved` holds as what was measured in the round.
 pub(crate) fn put_back(saved: Saved) {
     KEPT.with(|k| *k.borrow_mut() = saved.0);
+    AT_VALUES.with(|k| *k.borrow_mut() = saved.1);
 }
 
 /// What a B-tree leading with a column measured of it, for a table of `tuples` rows.
@@ -164,10 +200,61 @@ unsafe extern "C-unwind" fn relation_stats(
     match (*rte).rtekind {
         pg_sys::RTEKind::RTE_RELATION if (*rte).inh => parent_column(root, rte, attnum, vardata),
         pg_sys::RTEKind::RTE_RELATION => table_column(root, rte, attnum, vardata),
-        pg_sys::RTEKind::RTE_CTE => grouped_column(root, rte, attnum, vardata),
+        pg_sys::RTEKind::RTE_CTE => {
+            walked_column(root, rte, attnum, vardata) || grouped_column(root, rte, attnum, vardata)
+        }
         pg_sys::RTEKind::RTE_SUBQUERY => grouped_column(root, rte, attnum, vardata),
         _ => false,
     }
+}
+
+/// Statistics for column `attnum` of the WITH query `rte` reads, where it was read while the
+/// statement is planned and that column kept: each value the read returned with its share of the
+/// rows, the largest first; the distinct values; and the share of NULLs.
+unsafe fn walked_column(
+    root: *mut pg_sys::PlannerInfo,
+    rte: *mut pg_sys::RangeTblEntry,
+    attnum: pg_sys::AttrNumber,
+    vardata: *mut pg_sys::VariableStatData,
+) -> bool {
+    if (*rte).self_reference {
+        return false;
+    }
+    let Some(varno) = varno_of(root, rte) else {
+        return false;
+    };
+    let Some(walked) = closure::walked(root, varno, attnum) else {
+        return false;
+    };
+    if walked.rows == 0 || walked.values.is_empty() {
+        return false;
+    }
+    let equality =
+        (*pg_sys::lookup_type_cache(walked.kind, pg_sys::TYPECACHE_EQ_OPR as i32)).eq_opr;
+    if equality == pg_sys::InvalidOid {
+        return false;
+    }
+    let rows = walked.rows as f64;
+    let common = Common {
+        values: walked
+            .values
+            .iter()
+            .map(|&(v, n)| (v, n as f64 / rows, false))
+            .collect(),
+        kind: walked.kind,
+        equality,
+        collation: walked.collation,
+    };
+    let shares: Vec<f64> = common.values.iter().map(|v| v.1).collect();
+    let tuple = with_common(formed(pg_sys::InvalidOid, attnum), Some(&common), &shares);
+    let form = form_of(tuple);
+    (*form).stanullfrac = (walked.nulls as f64 / rows) as f32;
+    (*form).stadistinct = walked.values.len() as f32;
+    (*vardata).statsTuple = tuple;
+    (*vardata).freefunc = Some(free_statistics);
+    // the values the statement itself returns to its reader
+    (*vardata).acl_ok = true;
+    true
 }
 
 #[pg_guard]
@@ -278,7 +365,13 @@ unsafe fn table_column(
         pg_sys::bms_make_singleton(attnum as i32 - pg_sys::FirstLowInvalidHeapAttributeNumber),
     );
     let tuple = statistics(gathered, rel, (*rte).relid, attnum, &read, readable);
-    (*vardata).acl_ok = if gathered.is_null() && read.places.is_none() {
+    let (tuple, carried) = if read.places.is_none() {
+        let values = closure::equated_values(root, varno, attnum);
+        with_walked_values(tuple, gathered, (*rte).relid, rel, btree, &read, &values)
+    } else {
+        (tuple, false)
+    };
+    (*vardata).acl_ok = if gathered.is_null() && read.places.is_none() && !carried {
         // nothing but the counts, which carry no value of the table
         true
     } else {
@@ -1163,6 +1256,166 @@ fn fill(shares: &mut [f64], listed: &[bool], room: f64) {
     }
 }
 
+/// `tuple`, the statistics of the column the B-tree `btree` of the table `relid` (the planner's
+/// `rel`) leads with, with each of `values` (a WITH query's, read while planning) at the share the
+/// B-tree measures: added to its most common values where they do not name it and the share is
+/// above none, and in place of the share they give it where they name it, unless ANALYZE read every
+/// row of the table or the value lies inside one leaf or two that the descent could not reach; and
+/// whether any share changed. A value inside one leaf or two is counted on them; where the descent
+/// could not reach them and the statistics `gathered` do not name it, it takes the share they give
+/// it, held to those pages' rows.
+unsafe fn with_walked_values(
+    tuple: pg_sys::HeapTuple,
+    gathered: pg_sys::HeapTuple,
+    relid: pg_sys::Oid,
+    rel: *mut pg_sys::RelOptInfo,
+    btree: *mut pg_sys::IndexOptInfo,
+    read: &Vectors,
+    values: &[i64],
+) -> (pg_sys::HeapTuple, bool) {
+    if values.is_empty() {
+        return (tuple, false);
+    }
+    let kind = *(*btree).opcintype;
+    if !measure::countable(kind) {
+        return (tuple, false);
+    }
+    let equality = pg_sys::get_opfamily_member(
+        *(*btree).opfamily,
+        kind,
+        kind,
+        pg_sys::BTEqualStrategyNumber as i16,
+    );
+    if equality == pg_sys::InvalidOid {
+        return (tuple, false);
+    }
+    let listed = listed_values(tuple);
+    let places = Places {
+        measured: Vec::new(),
+        kind,
+        equality,
+        collation: *(*btree).indexcollations,
+    };
+    let named_by_analyze = |v: i64| listed.iter().any(|l| l.0 == v);
+    // where ANALYZE read every row, the values it names keep its count unread
+    let every_row = values.iter().any(|&v| named_by_analyze(v)) && every_row_analyzed(relid);
+    let to_measure: Vec<i64> = values
+        .iter()
+        .copied()
+        .filter(|&v| !every_row || !named_by_analyze(v))
+        .filter(|&v| measure::whole(measure::datum_of(v, kind), kind) == Some(v))
+        .collect();
+    let mut merged: Vec<(i64, f64, bool)> = listed.iter().map(|&(v, s)| (v, s, true)).collect();
+    let mut changed = false;
+    for (v, m) in measured_at(rel, btree, &to_measure) {
+        let Some(m) = m else {
+            continue;
+        };
+        let at = merged.iter().position(|e| e.0 == v);
+        // a value ANALYZE names inside one leaf or two that the descent could not reach keeps its
+        // count
+        if at.is_some() && m.only_bracketed() {
+            continue;
+        }
+        let rows = m
+            .rows_within(read.tuples, || {
+                Some(gathered_share(gathered, rel, &places, v))
+            })
+            .unwrap_or(0.0);
+        match at {
+            Some(at) => merged[at] = (v, rows / read.tuples, false),
+            None if rows > 0.0 => merged.push((v, rows / read.tuples, false)),
+            None => continue,
+        }
+        changed = true;
+    }
+    if !changed {
+        return (tuple, false);
+    }
+    merged.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut shares: Vec<f64> = merged.iter().map(|m| m.1).collect();
+    let named: Vec<bool> = merged.iter().map(|m| m.2).collect();
+    let room = (1.0 - (*form_of(tuple)).stanullfrac as f64).max(0.0);
+    let every = read.distinct == Some(merged.len() as f64);
+    if every || shares.iter().sum::<f64>() > room {
+        fill(&mut shares, &named, room);
+    }
+    let common = Common {
+        values: merged,
+        kind,
+        equality,
+        collation: places.collation,
+    };
+    (with_common(tuple, Some(&common), &shares), true)
+}
+
+/// What the B-tree `btree` of `rel` measures at each of `values`, one descent each, read once in a
+/// round: none for a value the descents did not reach once their pages would pass the pages of the
+/// table.
+unsafe fn measured_at(
+    rel: *mut pg_sys::RelOptInfo,
+    btree: *mut pg_sys::IndexOptInfo,
+    values: &[i64],
+) -> Vec<(i64, Option<measure::Measured>)> {
+    let oid = (*btree).indexoid;
+    let kind = *(*btree).opcintype;
+    let most = (*rel).pages;
+    let (mut used, mut kept) = AT_VALUES.with(|a| {
+        a.borrow()
+            .iter()
+            .find(|e| e.index == oid)
+            .map(|e| (e.pages, e.measured.clone()))
+            .unwrap_or((0, Vec::new()))
+    });
+    let new: Vec<i64> = values
+        .iter()
+        .copied()
+        .filter(|v| !kept.iter().any(|k| k.0 == *v))
+        .collect();
+    if !new.is_empty() {
+        let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        for v in new {
+            let part = Some((measure::datum_of(v, kind), kind));
+            let lower = End {
+                parts: vec![part],
+                after: false,
+            };
+            let upper = End {
+                parts: vec![part],
+                after: true,
+            };
+            let m = if used < most {
+                measure::rows_at(index, &lower, &upper, (*rel).tuples, true, most - used)
+            } else {
+                None
+            };
+            if let Some(m) = m {
+                used += m.pages;
+            } else {
+                // the rest are not read either
+                used = most;
+            }
+            kept.push((v, m));
+        }
+        pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        if round::depth() > 0 {
+            AT_VALUES.with(|a| {
+                let mut a = a.borrow_mut();
+                a.retain(|e| e.index != oid);
+                a.push(AtValues {
+                    index: oid,
+                    pages: used,
+                    measured: kept.clone(),
+                });
+            });
+        }
+    }
+    values
+        .iter()
+        .map(|v| (*v, kept.iter().find(|k| k.0 == *v).and_then(|k| k.1)))
+        .collect()
+}
+
 /// The kinds of statistics the five slots of a statistics tuple hold.
 unsafe fn kinds(tuple: pg_sys::HeapTuple) -> [i16; 5] {
     let f = form_of(tuple);
@@ -1934,6 +2187,205 @@ mod tests {
         let (listed, distinct) = common("forty");
         assert!(listed <= 10, "{listed}");
         assert_eq!(distinct, 40.0);
+    }
+
+    /// A realm of 300 themes, 30 roots each the parent of 9 others, with a B-tree on the parent and
+    /// a surveyor; and about 106,000 goods of those themes, a few themes holding thousands and most
+    /// a few dozen, with a B-tree on the theme and a surveyor. ANALYZE names 10 themes in its most
+    /// common values: theme 3 and the 9 other roots up to 10, the largest.
+    fn realm() {
+        Spi::run(
+            "CREATE TABLE realm (id int NOT NULL, parent_id int); \
+             INSERT INTO realm SELECT g, CASE WHEN g > 30 THEN 1 + (g - 31) / 9 END \
+             FROM generate_series(1, 300) g; \
+             CREATE INDEX ON realm (parent_id); \
+             CREATE INDEX realm_order ON realm USING surveyor (parent_id, id); \
+             CREATE TABLE goods AS SELECT row_number() OVER ()::int AS id, t AS theme_id, \
+                    repeat('x', 20) AS name \
+             FROM (SELECT t, CASE WHEN t = 3 THEN 12000 WHEN t <= 10 THEN 8000 \
+                     WHEN t BETWEEN 49 AND 57 \
+                       THEN (ARRAY[2500, 40, 1800, 7, 900, 2200, 150, 1300, 600])[t - 48] \
+                     ELSE 20 + (t * 7) % 50 END AS n \
+                   FROM generate_series(1, 300) t) c, generate_series(1, c.n) k; \
+             CREATE INDEX goods_theme ON goods (theme_id, id); \
+             CREATE INDEX goods_order ON goods USING surveyor (id); \
+             ALTER TABLE goods ALTER theme_id SET STATISTICS 10; ANALYZE goods; ANALYZE realm",
+        )
+        .unwrap();
+    }
+
+    /// Theme 3 and the 9 themes under it, read from the realm.
+    const UNDER_THREE: &str = "WITH RECURSIVE sub(id) AS (SELECT 3 UNION ALL \
+                               SELECT r.id FROM realm r JOIN sub ON r.parent_id = sub.id)";
+
+    #[pg_test]
+    fn a_join_to_a_recursive_query_read_while_planning_is_sized_by_the_rows_each_of_its_values_meets(
+    ) {
+        realm();
+        let goods = Spi::get_one::<pg_sys::Oid>("SELECT 'goods'::regclass::oid")
+            .unwrap()
+            .unwrap()
+            .to_u32();
+        let analyzed = Spi::get_one::<f32>(
+            "SELECT most_common_freqs[array_position(most_common_vals::text::int[], 3)] \
+             FROM pg_stats WHERE tablename = 'goods' AND attname = 'theme_id'",
+        )
+        .unwrap()
+        .expect("ANALYZE names theme 3");
+        let listed = number(
+            "SELECT count(*) FROM pg_stats, unnest(most_common_vals::text::int[]) v \
+             WHERE tablename = 'goods' AND attname = 'theme_id' AND v BETWEEN 49 AND 57",
+        );
+        assert_eq!(listed, 0.0, "ANALYZE names a theme under 3");
+        let rows = number("SELECT count(*) FROM goods");
+        let leaf = Spi::get_one::<f64>(
+            "SELECT reltuples::float8 / greatest(relpages - 2, 1) FROM pg_class \
+             WHERE relname = 'goods_theme'",
+        )
+        .unwrap()
+        .unwrap();
+        let joins = [
+            // joined
+            format!("{UNDER_THREE} SELECT g.id FROM sub JOIN goods g ON g.theme_id = sub.id"),
+            // a semi join
+            format!(
+                "{UNDER_THREE} SELECT g.id FROM goods g WHERE g.theme_id IN (SELECT id FROM sub)"
+            ),
+        ];
+        let wrong = joins
+            .iter()
+            .map(|joined| {
+                let truth = number(&format!("SELECT count(*) FROM ({joined}) j"));
+                let walk = estimated(joined, "CTE Scan on sub");
+                (estimated(joined, ""), truth, walk, joined)
+            })
+            .filter(|&(planned, truth, walk, _)| {
+                walk != 10.0 || (planned - truth).abs() > 0.05 * truth
+            })
+            .collect::<Vec<_>>();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        for joined in &joins {
+            let seen = handed(joined);
+            // the walk's ten themes, a tenth each
+            let walk = seen
+                .iter()
+                .find(|h| h.of == (0, 1))
+                .unwrap_or_else(|| panic!("{seen:?}"));
+            assert_eq!(walk.distinct, 10.0, "{walk:?}");
+            assert_eq!(walk.common.len(), 10, "{walk:?}");
+            assert!(
+                walk.common.iter().all(|c| (c.1 - 0.1).abs() < 1e-6),
+                "{walk:?}"
+            );
+            // the goods' themes: ANALYZE's ten, the nine under theme 3, and theme 3, which spans
+            // whole leaves of a table ANALYZE sampled, measured in place of ANALYZE's share
+            let theme = carried(&seen, goods);
+            assert_eq!(theme.common.len(), 19, "{theme:?}");
+            let three = share_of(&theme, 3);
+            assert_ne!(three as f32, analyzed, "{theme:?}");
+            assert!(
+                (three * rows - 12000.0).abs() <= 2.0 * leaf,
+                "{} measured, {leaf} a leaf: {theme:?}",
+                three * rows
+            );
+            assert!(
+                theme.common.windows(2).all(|w| w[0].1 >= w[1].1),
+                "{theme:?}"
+            );
+        }
+    }
+
+    /// The statistics handed for the theme, column 2, of the table `table` that list the most
+    /// values.
+    fn carried(seen: &[Handed], table: u32) -> Handed {
+        seen.iter()
+            .filter(|h| h.of == (table, 2))
+            .max_by_key(|h| h.common.len())
+            .unwrap_or_else(|| panic!("{seen:?}"))
+            .clone()
+    }
+
+    /// The share `handed` gives the value `value`.
+    fn share_of(handed: &Handed, value: i64) -> f64 {
+        handed
+            .common
+            .iter()
+            .find(|c| c.0 == Some(value))
+            .unwrap_or_else(|| panic!("{value}: {handed:?}"))
+            .1
+    }
+
+    /// The share ANALYZE's most common values give theme `value` of the table `table`.
+    fn analyzed_share(table: &str, value: i64) -> f32 {
+        Spi::get_one::<f32>(&format!(
+            "SELECT most_common_freqs[array_position(most_common_vals::text::int[], {value})] \
+             FROM pg_stats WHERE tablename = '{table}' AND attname = 'theme_id'"
+        ))
+        .unwrap()
+        .unwrap_or_else(|| panic!("ANALYZE names no {value} in {table}"))
+    }
+
+    #[pg_test]
+    fn a_listed_value_of_a_table_analyze_read_whole_keeps_the_share_analyze_gives_it() {
+        realm();
+        // a column's target that makes ANALYZE read every row
+        Spi::run("ALTER TABLE goods ALTER name SET STATISTICS 400; ANALYZE goods").unwrap();
+        let goods = Spi::get_one::<pg_sys::Oid>("SELECT 'goods'::regclass::oid")
+            .unwrap()
+            .unwrap()
+            .to_u32();
+        let rows = number("SELECT count(*) FROM goods");
+        let analyzed = analyzed_share("goods", 3);
+        assert!((analyzed as f64 * rows - 12000.0).abs() < 1.0, "{analyzed}");
+        let seen = handed(&format!(
+            "{UNDER_THREE} SELECT g.id FROM sub JOIN goods g ON g.theme_id = sub.id"
+        ));
+        let theme = carried(&seen, goods);
+        assert_eq!(theme.common.len(), 19, "{theme:?}");
+        assert_eq!(share_of(&theme, 3) as f32, analyzed, "{theme:?}");
+    }
+
+    #[pg_test]
+    fn a_listed_value_inside_one_or_two_leaves_is_counted_on_them() {
+        realm();
+        // 200,000 rows, ANALYZE sampling 30,000: themes 1 and 900 hold 2,000 each, 7 holds 101 and
+        // 8 holds 100 inside one or two leaves, and every other row a theme of its own; ANALYZE
+        // names the four and no other, and no sample of its own gives 7 a share of 101 rows
+        Spi::run(
+            "CREATE TABLE sparse AS SELECT g AS id, CASE WHEN g <= 2000 THEN 1 WHEN g <= 2101 THEN 7 \
+                 WHEN g <= 2201 THEN 8 WHEN g <= 4201 THEN 900 ELSE 10000 + g END AS theme_id \
+             FROM generate_series(1, 200000) g; \
+             CREATE INDEX sparse_theme ON sparse (theme_id, id); \
+             CREATE INDEX sparse_order ON sparse USING surveyor (id); ANALYZE sparse",
+        )
+        .unwrap();
+        let sparse = Spi::get_one::<pg_sys::Oid>("SELECT 'sparse'::regclass::oid")
+            .unwrap()
+            .unwrap()
+            .to_u32();
+        // ANALYZE names theme 7
+        analyzed_share("sparse", 7);
+        // theme 7 and the 9 themes under it, none of which the sparse rows hold
+        let seen = handed(
+            "WITH RECURSIVE sub(id) AS (SELECT 7 UNION ALL \
+             SELECT r.id FROM realm r JOIN sub ON r.parent_id = sub.id) \
+             SELECT p.id FROM sub JOIN sparse p ON p.theme_id = sub.id",
+        );
+        let theme = carried(&seen, sparse);
+        // theme 7 counted on its leaves, and the themes under it, which hold no row, not listed
+        let rows = number("SELECT count(*) FROM sparse");
+        assert!(
+            (share_of(&theme, 7) * rows - 101.0).abs() <= 0.5,
+            "{} handed: {theme:?}",
+            share_of(&theme, 7) * rows
+        );
+        assert_eq!(theme.common.len(), 4, "{theme:?}");
+        // theme 1, which is no value of the walk, as ANALYZE gives it
+        assert_eq!(
+            share_of(&theme, 1) as f32,
+            analyzed_share("sparse", 1),
+            "{theme:?}"
+        );
     }
 
     #[pg_test]

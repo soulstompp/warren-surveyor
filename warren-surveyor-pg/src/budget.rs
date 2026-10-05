@@ -109,6 +109,7 @@ struct Budget {
 /// the statement is planned, and the half of them the reads of column statistics may read.
 #[derive(Clone, Copy)]
 struct Counted {
+    rows: f64,
     limit: u64,
     half: u64,
 }
@@ -132,7 +133,7 @@ impl Budget {
         if let Some(c) = self.counted {
             return c;
         }
-        let (pages, _) = count(&self.tables);
+        let (pages, rows) = count(&self.tables);
         let pages = pages.max(0.0) as u64;
         let limit = match crate::price::planning_read_limit() {
             0 => 0,
@@ -140,6 +141,7 @@ impl Budget {
             _ => pages,
         };
         let c = Counted {
+            rows,
             limit,
             half: limit / 2,
         };
@@ -306,6 +308,11 @@ pub(crate) fn left() -> u32 {
         None if crate::price::planning_read_limit() == 0 => 0,
         None => u32::MAX,
     }
+}
+
+/// The rows the planner takes the statement's tables to hold; none outside a statement's planning.
+pub(crate) fn statement_rows() -> Option<f64> {
+    with(|b| unsafe { b.counted().rows })
 }
 
 /// Draws one page of the index `index` for a read about to read it. False, and the read stops,

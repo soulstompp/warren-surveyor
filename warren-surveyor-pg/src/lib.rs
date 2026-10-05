@@ -9,6 +9,7 @@ use pgrx::prelude::*;
 
 mod budget;
 mod carried;
+mod closure;
 #[allow(dead_code)]
 mod conditions;
 #[allow(dead_code)]
@@ -36,6 +37,7 @@ mod writes;
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
+    closure::init();
     size::init();
     leaves::init();
     round::init();
@@ -425,6 +427,257 @@ mod tests {
         .unwrap();
     }
 
+    // the size of a WITH RECURSIVE query, read while planning
+
+    /// A tree of 200 themes, 20 roots each the parent of 9 others, beside 19,800 roots with nothing
+    /// under them; a B-tree on the parent and a surveyor. `tree_plain` holds the same rows and
+    /// B-tree with no surveyor.
+    fn tree() {
+        Spi::run(
+            "CREATE TABLE tree (id int NOT NULL, parent_id int); \
+             INSERT INTO tree SELECT g, CASE WHEN g > 20 AND g <= 200 THEN 1 + (g - 21) / 9 END \
+             FROM generate_series(1, 20000) g; \
+             CREATE TABLE tree_plain AS SELECT * FROM tree; \
+             CREATE INDEX ON tree (parent_id); CREATE INDEX ON tree_plain (parent_id); \
+             CREATE INDEX tree_key ON tree USING surveyor (parent_id, id); \
+             ANALYZE tree; ANALYZE tree_plain",
+        )
+        .expect("the tree could not be made");
+    }
+
+    /// Theme 3 and the themes under it, counted, read from `table`.
+    fn subtree(table: &str) -> String {
+        format!(
+            "WITH RECURSIVE sub(id) AS (SELECT 3 UNION ALL \
+             SELECT t.id FROM {table} t JOIN sub ON t.parent_id = sub.id) \
+             SELECT count(*)::text FROM sub"
+        )
+    }
+
+    /// The rows the plan of `query` estimates on its first line naming `node`.
+    fn estimated(query: &str, node: &str) -> f64 {
+        let plan = texts(&format!("EXPLAIN {query}"));
+        let line = plan
+            .iter()
+            .find(|l| l.contains(node))
+            .unwrap_or_else(|| panic!("no {node}: {plan:?}"));
+        let at = line.find("rows=").expect("no rows") + 5;
+        line[at..].split(' ').next().unwrap().parse().unwrap()
+    }
+
+    #[pg_test]
+    fn a_recursive_query_over_a_surveyor_table_is_planned_at_the_rows_it_returns() {
+        tree();
+        assert_eq!(texts(&subtree("tree")), vec!["10"]);
+        assert_eq!(estimated(&subtree("tree"), "CTE Scan on sub"), 10.0);
+        // the recursive query's own plan keeps the planner's estimate
+        assert_ne!(estimated(&subtree("tree"), "Recursive Union"), 10.0);
+        // over a table with no surveyor, the planner's estimate stands
+        assert_eq!(texts(&subtree("tree_plain")), vec!["10"]);
+        assert_ne!(estimated(&subtree("tree_plain"), "CTE Scan on sub"), 10.0);
+    }
+
+    #[pg_test]
+    fn a_kept_plan_of_a_recursive_query_returns_the_rows_the_table_holds_when_it_runs() {
+        tree();
+        Spi::run(&format!("PREPARE kept AS {}", subtree("tree"))).unwrap();
+        assert_eq!(texts("EXECUTE kept"), vec!["10"]);
+        Spi::run("DELETE FROM tree WHERE id = 39").unwrap();
+        // the plan made before the delete is run again
+        assert_eq!(estimated("EXECUTE kept", "CTE Scan on sub"), 10.0);
+        assert_eq!(texts("EXECUTE kept"), vec!["9"]);
+        Spi::run("DEALLOCATE kept").unwrap();
+    }
+
+    #[pg_test]
+    fn a_recursive_query_that_takes_a_value_from_outside_it_keeps_the_planners_estimate() {
+        tree();
+        let walk = "SELECT t.id FROM tree t JOIN sub ON t.parent_id = sub.id";
+        for query in [
+            // a volatile function
+            format!(
+                "WITH RECURSIVE sub(id) AS (SELECT (random() * 0)::int + 3 UNION ALL {walk}) \
+                 SELECT count(*)::text FROM sub"
+            ),
+            // another WITH query
+            format!(
+                "WITH RECURSIVE r AS MATERIALIZED (SELECT 3 AS id), \
+                 sub(id) AS (SELECT id FROM r UNION ALL {walk}) SELECT count(*)::text FROM sub"
+            ),
+            // a column of the query around it
+            format!(
+                "SELECT (SELECT count(*) FROM (WITH RECURSIVE sub(id) AS (SELECT o.id UNION ALL {walk}) \
+                 SELECT id FROM sub) s)::text FROM tree o WHERE o.id = 3"
+            ),
+        ] {
+            assert_eq!(texts(&query), vec!["10"], "{query}");
+            assert_ne!(estimated(&query, "CTE Scan on sub"), 10.0, "{query}");
+        }
+        // a parameter
+        Spi::run(&format!(
+            "PREPARE from_root(int) AS WITH RECURSIVE sub(id) AS (SELECT $1 UNION ALL {walk}) \
+             SELECT count(*)::text FROM sub"
+        ))
+        .unwrap();
+        assert_eq!(texts("EXECUTE from_root(3)"), vec!["10"]);
+        assert_ne!(estimated("EXECUTE from_root(3)", "CTE Scan on sub"), 10.0);
+        Spi::run("DEALLOCATE from_root").unwrap();
+    }
+
+    #[pg_test]
+    fn a_recursive_query_of_many_rows_whose_read_takes_few_pages_is_planned_at_its_rows() {
+        tree();
+        // the tree is read once, before the first step
+        let many = "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
+                    WHERE sub.id < 10000 AND EXISTS (SELECT FROM tree WHERE tree.id = 1)) \
+                    SELECT count(*)::text FROM sub";
+        assert_eq!(texts(many), vec!["10000"]);
+        assert_eq!(estimated(many, "CTE Scan on sub"), 10000.0);
+    }
+
+    #[pg_test]
+    fn a_recursive_query_whose_read_passes_its_tables_pages_or_fails_keeps_the_planners_estimate() {
+        tree();
+        // each step reads the tree again
+        let past = "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
+                    WHERE sub.id < 10000 AND EXISTS (SELECT FROM tree WHERE tree.id = sub.id % 7 + 1)) \
+                    SELECT count(*)::text FROM sub";
+        assert_eq!(texts(past), vec!["10000"]);
+        assert_ne!(estimated(past, "CTE Scan on sub"), 10000.0);
+        // the read raises an error, and the statement is planned all the same
+        let failing = "WITH RECURSIVE sub(id) AS (SELECT 3 UNION ALL \
+                       SELECT t.id / (t.id - t.id) FROM tree t JOIN sub ON t.parent_id = sub.id) \
+                       SELECT count(*) FROM sub";
+        assert_ne!(estimated(failing, "CTE Scan on sub"), 10.0);
+        assert_eq!(texts(&subtree("tree")), vec!["10"]);
+        assert_eq!(estimated(&subtree("tree"), "CTE Scan on sub"), 10.0);
+    }
+
+    #[pg_test]
+    fn a_recursive_query_that_returns_more_rows_than_its_tables_hold_keeps_the_planners_estimate() {
+        tree();
+        // the tree is read once, before the first step, and no step reads a page
+        let past = "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
+                    WHERE sub.id < 30000 AND EXISTS (SELECT FROM tree WHERE tree.id = 1)) \
+                    SELECT count(*)::text FROM sub";
+        assert_eq!(texts(past), vec!["30000"]);
+        assert_ne!(estimated(past, "CTE Scan on sub"), 30000.0);
+        // fewer rows than the tree holds
+        let within = past.replace("30000", "19000");
+        assert_eq!(estimated(&within, "CTE Scan on sub"), 19000.0);
+    }
+
+    /// A tree of 60 themes on one page, theme `n` the parent of themes `2n` and `2n + 1`, with a
+    /// B-tree on the parent and a surveyor; and 20,000 sets of those themes on many pages, kept as
+    /// one table, as a partitioned table of two partitions, and as an inheritance parent with no rows
+    /// of its own over two children.
+    fn twig() {
+        Spi::run(
+            "CREATE TABLE twig (id int NOT NULL, parent_id int); \
+             INSERT INTO twig SELECT g, CASE WHEN g > 1 THEN g / 2 END FROM generate_series(1, 60) g; \
+             CREATE INDEX ON twig (parent_id); \
+             CREATE INDEX twig_key ON twig USING surveyor (parent_id, id); \
+             CREATE TABLE twig_sets AS SELECT g AS id, 1 + g % 60 AS theme_id, repeat('x', 100) AS name \
+             FROM generate_series(1, 20000) g; \
+             CREATE UNIQUE INDEX ON twig_sets (id); \
+             CREATE TABLE twig_parts (id int, theme_id int, name text) PARTITION BY RANGE (id); \
+             CREATE TABLE twig_parts_low PARTITION OF twig_parts FOR VALUES FROM (1) TO (10001); \
+             CREATE TABLE twig_parts_high PARTITION OF twig_parts FOR VALUES FROM (10001) TO (20001); \
+             INSERT INTO twig_parts SELECT * FROM twig_sets; \
+             CREATE TABLE twig_kinds (id int, theme_id int, name text); \
+             CREATE TABLE twig_kinds_low () INHERITS (twig_kinds); \
+             CREATE TABLE twig_kinds_high () INHERITS (twig_kinds); \
+             INSERT INTO twig_kinds_low SELECT * FROM twig_sets WHERE id <= 10000; \
+             INSERT INTO twig_kinds_high SELECT * FROM twig_sets WHERE id > 10000; \
+             ANALYZE twig; ANALYZE twig_sets; ANALYZE twig_parts; ANALYZE twig_kinds",
+        )
+        .expect("the twig could not be made");
+    }
+
+    /// Theme 2 and the themes under it, 31 of them, read from the twig.
+    const UNDER_TWO: &str = "WITH RECURSIVE sub(id) AS (SELECT 2 UNION ALL \
+                             SELECT t.id FROM twig t JOIN sub ON t.parent_id = sub.id)";
+
+    #[pg_test]
+    fn a_recursive_query_read_within_the_pages_of_the_tables_its_statement_reads_is_planned_at_its_rows(
+    ) {
+        twig();
+        assert_eq!(
+            texts(&format!("{UNDER_TWO} SELECT count(*)::text FROM sub")),
+            vec!["31"]
+        );
+        let wrong = [
+            // joined
+            format!(
+                "{UNDER_TWO} SELECT count(*)::text FROM sub JOIN twig_sets s ON s.theme_id = sub.id"
+            ),
+            // in a sublink
+            format!(
+                "{UNDER_TWO} SELECT (count(*) + 0 * (SELECT max(theme_id) FROM twig_sets))::text \
+                 FROM sub"
+            ),
+            // in another WITH query
+            format!(
+                "{UNDER_TWO}, s AS MATERIALIZED (SELECT theme_id FROM twig_sets) \
+                 SELECT count(*)::text FROM sub JOIN s ON s.theme_id = sub.id"
+            ),
+            // a partitioned table, joined and in a sublink of its own
+            format!(
+                "{UNDER_TWO} SELECT count(*)::text FROM sub JOIN twig_parts s ON s.theme_id = sub.id"
+            ),
+            format!(
+                "{UNDER_TWO} SELECT count(*)::text FROM sub \
+                 WHERE sub.id IN (SELECT theme_id FROM twig_parts GROUP BY theme_id)"
+            ),
+            // an inheritance parent, in a subquery of its own
+            format!(
+                "{UNDER_TWO} SELECT count(*)::text FROM sub \
+                 JOIN (SELECT theme_id FROM twig_kinds OFFSET 0) s ON s.theme_id = sub.id"
+            ),
+        ]
+        .into_iter()
+        .map(|query| (estimated(&query, "CTE Scan on sub"), query))
+        .filter(|&(rows, _)| rows != 31.0)
+        .collect::<Vec<_>>();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert_eq!(
+            texts(&format!(
+                "{UNDER_TWO} SELECT count(*)::text FROM sub JOIN twig_sets s ON s.theme_id = sub.id"
+            )),
+            texts(
+                "SELECT count(*)::text FROM twig_sets WHERE theme_id IN \
+                 (2, 4, 5, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, \
+                  32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47)"
+            )
+        );
+    }
+
+    #[pg_test]
+    fn a_recursive_query_whose_read_passes_the_pages_of_the_tables_its_statement_reads_keeps_the_planners_estimate(
+    ) {
+        twig();
+        let read = [
+            // the statement reads the tree alone
+            format!("{UNDER_TWO} SELECT count(*)::text FROM sub"),
+            // the sets are written, never read
+            format!("{UNDER_TWO} INSERT INTO twig_sets SELECT 20000 + sub.id, sub.id, '' FROM sub"),
+            format!(
+                "{UNDER_TWO} INSERT INTO twig_sets SELECT 20000 + sub.id, sub.id, '' FROM sub \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name"
+            ),
+        ]
+        .into_iter()
+        .filter(|query| estimated(query, "CTE Scan on sub") == 31.0)
+        .collect::<Vec<_>>();
+        assert!(read.is_empty(), "{read:#?}");
+        // each step reads the tree again, past the pages of the tree and the sets
+        let past = "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
+                    WHERE sub.id < 10000 AND EXISTS (SELECT FROM twig WHERE twig.id = sub.id % 7 + 1)) \
+                    SELECT count(*)::text FROM sub JOIN twig_sets s ON s.id = sub.id";
+        assert_eq!(texts(past), vec!["10000"]);
+        assert_ne!(estimated(past, "CTE Scan on sub"), 10000.0);
+    }
+
     #[pg_test]
     fn every_operator_class_validates() {
         assert_eq!(
@@ -546,6 +799,138 @@ mod sessions {
             assert_eq!(row.get::<_, i64>(0), 0, "{step}");
             assert!(row.get::<_, bool>(1), "{step}");
         }
+    }
+
+    #[test]
+    fn a_cancel_inside_the_read_of_a_recursive_query_is_raised_as_a_cancel_and_the_session_goes_on()
+    {
+        let mut db = session();
+        db.batch_execute(
+            "DROP TABLE IF EXISTS halted; DROP FUNCTION IF EXISTS halted_at(int); \
+             CREATE TABLE halted AS SELECT g AS id FROM generate_series(1, 20000) g; \
+             CREATE INDEX ON halted (id); \
+             CREATE INDEX halted_order ON halted USING surveyor (id); \
+             ANALYZE halted; \
+             CREATE FUNCTION halted_at(int) RETURNS int IMMUTABLE LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 IF $1 > 5 THEN RAISE EXCEPTION 'halted at %', $1 USING ERRCODE = 'query_canceled'; END IF; \
+                 RETURN $1; \
+             END $$; \
+             LOAD 'warren_surveyor_pg'",
+        )
+        .unwrap();
+        // the read raises a cancel at its sixth row, as a statement timeout or a cancel request
+        // raises one while it runs
+        let planned = db
+            .query(
+                "EXPLAIN WITH RECURSIVE n(i) AS (SELECT min(id) FROM halted \
+                 UNION ALL SELECT halted_at(i + 1) FROM n WHERE i < 10) SELECT count(*) FROM n",
+                &[],
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                e.as_db_error().map_or_else(
+                    || e.to_string(),
+                    |d| format!("{}: {}", d.code().code(), d.message()),
+                )
+            });
+        let after = db
+            .query_one("SELECT count(*) FROM halted", &[])
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string());
+        db.batch_execute("DROP TABLE halted; DROP FUNCTION halted_at(int)")
+            .ok();
+        assert_eq!(planned, Err("57014: halted at 6".to_string()));
+        assert_eq!(after, Ok(20000));
+    }
+
+    #[test]
+    fn a_recursive_query_that_never_ends_is_planned_without_being_read_to_its_end() {
+        let mut db = session();
+        db.batch_execute(
+            "DROP TABLE IF EXISTS endless; \
+             CREATE TABLE endless AS SELECT g AS id FROM generate_series(1, 20000) g; \
+             CREATE INDEX ON endless (id); \
+             CREATE INDEX endless_order ON endless USING surveyor (id); \
+             ANALYZE endless; \
+             LOAD 'warren_surveyor_pg'; SET statement_timeout = '10s'",
+        )
+        .unwrap();
+        let message = |e: postgres::Error| {
+            e.as_db_error()
+                .map_or_else(|| e.to_string(), |d| d.message().to_string())
+        };
+        // its first step reads a few pages of the table, and no step after it reads one
+        let endless = "WITH RECURSIVE n(i) AS (SELECT min(id) FROM endless \
+                       UNION ALL SELECT i + 1 FROM n)";
+        let failed = [
+            // ended by the LIMIT
+            format!("{endless} SELECT * FROM n LIMIT 10"),
+            // ended by the first row past a value
+            format!("{endless} SELECT (SELECT i FROM n WHERE i > 100 LIMIT 1)"),
+            // never ended, and only planned
+            format!("{endless} SELECT count(*) FROM n"),
+        ]
+        .into_iter()
+        .filter_map(|query| {
+            db.query(&format!("EXPLAIN {query}"), &[])
+                .err()
+                .map(|e| format!("{query}: {}", message(e)))
+        })
+        .collect::<Vec<_>>();
+        let rows = db
+            .query_one(
+                &format!("{endless} SELECT count(*) FROM (SELECT * FROM n LIMIT 10) s"),
+                &[],
+            )
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(message);
+        db.batch_execute("DROP TABLE endless").ok();
+        assert!(failed.is_empty(), "{failed:#?}");
+        assert_eq!(rows, Ok(10));
+    }
+
+    #[test]
+    fn a_recursive_query_read_while_planning_waits_for_no_lock_on_a_partition_the_planner_prunes() {
+        let mut holder = session();
+        holder
+            .batch_execute(
+                "DROP TABLE IF EXISTS pruned_twig, pruned_parts; \
+                 CREATE TABLE pruned_twig (id int NOT NULL, parent_id int); \
+                 INSERT INTO pruned_twig SELECT g, CASE WHEN g > 1 THEN g / 2 END \
+                 FROM generate_series(1, 60) g; \
+                 CREATE INDEX ON pruned_twig (parent_id); \
+                 CREATE INDEX pruned_twig_key ON pruned_twig USING surveyor (parent_id, id); \
+                 CREATE TABLE pruned_parts (id int, theme_id int) PARTITION BY RANGE (id); \
+                 CREATE TABLE pruned_parts_low PARTITION OF pruned_parts FOR VALUES FROM (1) TO (10001); \
+                 CREATE TABLE pruned_parts_high PARTITION OF pruned_parts FOR VALUES FROM (10001) TO (20001); \
+                 INSERT INTO pruned_parts SELECT g, 1 + g % 60 FROM generate_series(1, 20000) g; \
+                 ANALYZE pruned_twig; ANALYZE pruned_parts",
+            )
+            .unwrap();
+        holder
+            .batch_execute("BEGIN; LOCK TABLE pruned_parts_high IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let mut db = session();
+        db.batch_execute("LOAD 'warren_surveyor_pg'; SET statement_timeout = '3s'")
+            .unwrap();
+        let planned = db
+            .query(
+                "EXPLAIN WITH RECURSIVE sub(id) AS (SELECT 2 UNION ALL \
+                 SELECT t.id FROM pruned_twig t JOIN sub ON t.parent_id = sub.id) \
+                 SELECT count(*) FROM sub JOIN pruned_parts p ON p.theme_id = sub.id \
+                 WHERE p.id < 100",
+                &[],
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                e.as_db_error()
+                    .map_or_else(|| e.to_string(), |d| d.message().to_string())
+            });
+        holder
+            .batch_execute("COMMIT; DROP TABLE pruned_twig, pruned_parts")
+            .unwrap();
+        assert_eq!(planned, Ok(()));
     }
 
     /// A session on the database `name` of the server `db` is a session on.
