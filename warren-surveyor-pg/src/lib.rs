@@ -12,6 +12,8 @@ mod budget;
 mod conditions;
 #[allow(dead_code)]
 mod gin;
+#[allow(dead_code)]
+mod gist;
 mod leaves;
 #[allow(dead_code)]
 mod measure;
@@ -22,6 +24,7 @@ mod price;
 mod query;
 #[allow(dead_code)]
 mod reading;
+mod region;
 mod round;
 mod size;
 mod writes;
@@ -213,6 +216,15 @@ mod tests {
             Ok::<_, pgrx::spi::SpiError>(out)
         })
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// Fixes the choices a GiST build makes between pages that take an entry equally well, which
+    /// PostgreSQL draws from the session's own random state and `setseed` leaves alone, so that the
+    /// same rows build the same index on every run. It is called in the statement before the build:
+    /// a server built with assertions draws from that state on every miss of its catalog caches.
+    #[pg_extern]
+    fn same_gist_every_run() {
+        unsafe { pg_sys::pg_prng_seed(std::ptr::addr_of_mut!(pg_sys::pg_global_prng_state), 1) };
     }
 
     fn plan(sql: &str) -> String {

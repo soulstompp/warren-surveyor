@@ -29,9 +29,9 @@
 //! whose predicate the planner proved from the question's own conditions.
 
 use crate::conditions::{self, Held};
-use crate::gin;
 use crate::query::{cells, surveyed, surveyor_am};
 use crate::round;
+use crate::{gin, gist};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::cell::RefCell;
@@ -210,6 +210,7 @@ unsafe fn holds(
             })
         }
         pg_sys::GIN_AM_OID => (gin::holds(root, rel, index, counted), 0),
+        pg_sys::GIST_AM_OID => (gist::holds(root, rel, index, counted), 0),
         _ => (Vec::new(), 0),
     }
 }
@@ -252,6 +253,7 @@ pub(crate) unsafe fn measure_on_leaves(
         pg_sys::BTREE_AM_OID => conditions::held_on_leaves(root, rel, index, counted)
             .map_or((None, None), |(h, l)| (Some(h), l)),
         pg_sys::GIN_AM_OID => (gin::held_except(root, rel, index, counted), None),
+        pg_sys::GIST_AM_OID => (gist::held_except(root, rel, index, counted), None),
         _ => (None, None),
     };
     if depth > 0 {
@@ -657,6 +659,56 @@ mod tests {
         // the planner's product of the lane's and the slot's shares, a fifth of the pair's rows
         let pair = estimates(&format!("{base} lane = 1 AND slot = 6"), "on bought")[0];
         assert!(pair > 4000.0, "{pair}");
+    }
+
+    /// 20,000 spots, one in every 500 holding the word "rare" and the rest "plain", each at a
+    /// random place in a box 100 by 200, with a GIN on the words and a GiST on the places. The
+    /// words keep no statistics.
+    fn spots() {
+        Spi::run(
+            "CREATE EXTENSION IF NOT EXISTS cube; SELECT setseed(0.29); \
+             CREATE TABLE spots AS SELECT g AS id, \
+                 to_tsvector('simple', CASE WHEN g % 500 = 0 THEN 'rare' ELSE 'plain' END) AS words, \
+                 cube(ARRAY[random() * 100, random() * 200]) AS place \
+             FROM generate_series(1, 20000) g; \
+             ALTER TABLE spots ALTER words SET STATISTICS 0; \
+             CREATE INDEX spots_words ON spots USING gin (words); \
+             SELECT tests.same_gist_every_run(); \
+             CREATE INDEX spots_place ON spots USING gist (place); \
+             ANALYZE spots",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn a_word_and_a_box_are_measured_by_the_gin_and_the_gist() {
+        spots();
+        let base = "SELECT id FROM spots WHERE";
+        let word = "words @@ 'rare'::tsquery";
+        let place = "place <@ cube(ARRAY[0, 0]::float8[], ARRAY[10, 20]::float8[])";
+        let planned: Vec<f64> = [word, place]
+            .iter()
+            .map(|c| estimates(&format!("{base} {c}"), "on spots")[0])
+            .collect();
+        Spi::run("CREATE INDEX spots_order ON spots USING surveyor (id)").unwrap();
+        // the word's rows, counted by the GIN
+        let counted = count(&format!("SELECT count(*) FROM spots WHERE {word}"));
+        let rows = estimates(&format!("{base} {word}"), "on spots")[0];
+        assert_eq!(rows, counted, "planned {}", planned[0]);
+        assert!(
+            (planned[0] - counted).abs() > 10.0,
+            "planned {}",
+            planned[0]
+        );
+        // the box's rows, measured by the GiST
+        let counted = count(&format!("SELECT count(*) FROM spots WHERE {place}"));
+        let rows = estimates(&format!("{base} {place}"), "on spots")[0];
+        assert!(
+            rows >= 0.25 * counted && rows <= 4.0 * counted,
+            "{rows} against {counted}, planned {}",
+            planned[1]
+        );
+        assert!(planned[1] < 0.2 * counted, "planned {}", planned[1]);
     }
 
     #[pg_test]

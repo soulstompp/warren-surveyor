@@ -108,6 +108,18 @@ mod tests {
                     None,
                 ));
             }
+            if let Some((m, clauses)) = crate::gist::survey(root, rel, index) {
+                s.borrow_mut().push((
+                    name(index),
+                    m.rows,
+                    m.pages as i32,
+                    clauses.len() as i32,
+                    Some(m.depth as i32),
+                    Some(m.below),
+                    Some(m.named as i32),
+                    Some(m.leaves_read as i32),
+                ));
+            }
         });
         let out = seen.borrow().clone();
         TableIterator::new(out)
