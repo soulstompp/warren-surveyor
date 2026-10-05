@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "warren-pg-speller"
+version = "0.1.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Kenneth Allen Flegal"]
+description = "A PostgreSQL planner hook that respells a SELECT by three rules that return the same rows, before it is planned"
+repository = "https://github.com/soulstompp/warren-surveyor"
+readme = "README.md"
+keywords = ["postgresql", "planner", "pgrx", "sql"]
+categories = ["database"]
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+pg19 = ["pgrx/pg19"]
+
+[dependencies]
+pgrx = "=0.19.2"

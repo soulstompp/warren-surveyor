@@ -35,15 +35,25 @@ mod query;
 #[allow(dead_code)]
 mod reading;
 mod region;
+#[cfg(any(test, feature = "pg_test"))]
+mod respelling;
 mod round;
 mod size;
 mod writes;
 
 ::pgrx::pg_module_magic!(name, version);
 
+/// Installs warren-pg-speller's respelling, and loads the size of a WITH RECURSIVE query read while
+/// planning, a table's rows measured by its indexes, the statistics hooks, the round of planning
+/// that keeps what they measure, holds their reads to the statement's budget and weighs a
+/// statement's pages by its drives, the grouping at one value of a leading column, the price of a
+/// table's B-trees with the settings, and the storage parameters.
+/// A statement is planned through them only once the library is loaded, so it is preloaded where
+/// every statement should be.
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
+    warren_pg_speller::init();
     closure::init();
     size::init();
     leaves::init();
@@ -1273,6 +1283,48 @@ mod sessions {
         pgrx_tests::client()
             .expect("no session on the test server")
             .0
+    }
+
+    #[test]
+    fn a_session_that_loads_the_library_respells_its_next_statement() {
+        let mut setup = session();
+        setup
+            .batch_execute(
+                "DROP TABLE IF EXISTS late_buys, late_holdings, late_builders, late_lines; \
+                 CREATE TABLE late_builders (builder_id int PRIMARY KEY, zone int NOT NULL); \
+                 INSERT INTO late_builders SELECT g, g % 7 FROM generate_series(1, 200) g; \
+                 CREATE TABLE late_holdings (builder_id int NOT NULL, row_no int NOT NULL, \
+                                             set_num text NOT NULL, PRIMARY KEY (builder_id, row_no)); \
+                 INSERT INTO late_holdings SELECT w.builder_id, r, 's' || ((w.builder_id * 17 + r * 31) % 50) \
+                 FROM late_builders w CROSS JOIN generate_series(1, 5) r; \
+                 CREATE TABLE late_buys (id int PRIMARY KEY, builder_id int NOT NULL, row_no int NOT NULL); \
+                 INSERT INTO late_buys SELECT g, h.builder_id, h.row_no FROM generate_series(1, 2000) g \
+                     JOIN late_holdings h ON h.builder_id = 1 + (g * 7919) % 1000 % 200 \
+                                         AND h.row_no = 1 + (g * 7919) % 1000 / 200; \
+                 CREATE TABLE late_lines (set_num text NOT NULL, part int NOT NULL, qty int NOT NULL); \
+                 INSERT INTO late_lines SELECT 's' || (g % 50), g % 13, 1 + g % 4 \
+                 FROM generate_series(1, 1000) g; \
+                 ANALYZE late_builders; ANALYZE late_holdings; ANALYZE late_buys; ANALYZE late_lines",
+            )
+            .unwrap();
+        // a new session that loads the library first
+        let mut fresh = session();
+        fresh.batch_execute("LOAD 'warren_surveyor_pg'").unwrap();
+        let first: String = fresh
+            .query(
+                "EXPLAIN (COSTS OFF, VERBOSE) SELECT w.zone, l.part, count(DISTINCT b.id), sum(l.qty) \
+                 FROM late_buys b JOIN late_holdings h ON h.builder_id = b.builder_id AND h.row_no = b.row_no \
+                     JOIN late_builders w ON w.builder_id = h.builder_id \
+                     JOIN late_lines l ON l.set_num = h.set_num GROUP BY 1, 2",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // the first side's grouping, read by the join and by the second side
+        assert_eq!(first.matches("CTE Scan on side_a").count(), 2, "{first}");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["warren-surveyor-pg"]
+members = ["warren-surveyor-pg", "warren-pg-speller"]
 resolver = "2"
 
 [profile.dev]

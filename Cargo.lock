@@ -1905,6 +1905,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-pg-speller"
+version = "0.1.1"
+dependencies = [
+ "pgrx",
+]
+
+[[package]]
 name = "warren-surveyor-pg"
 version = "0.1.0"
 dependencies = [
@@ -1912,6 +1919,7 @@ dependencies = [
  "pgrx-bench",
  "pgrx-tests",
  "postgres",
+ "warren-pg-speller",
 ]
 
 [[package]]

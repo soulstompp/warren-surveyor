@@ -11,3 +11,4 @@ tables the statement reads, and where they stop, PostgreSQL's own estimate stand
 | crate | for |
 |---|---|
 | `warren-surveyor-pg` | PostgreSQL 18: the extension `warren_surveyor_pg` and its index access method, `surveyor` |
+| `warren-pg-speller` | PostgreSQL 18: a planner hook that plans a `SELECT` through another spelling of it that returns the same rows; `warren_surveyor_pg` installs it |

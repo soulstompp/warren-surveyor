@@ -16,13 +16,14 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["pg18"]
-pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg19 = ["pgrx/pg19", "pgrx-tests/pg19"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "warren-pg-speller/pg18"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19", "warren-pg-speller/pg19"]
 pg_test = []
 pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 pgrx = "=0.19.2"
+warren-pg-speller = { path = "../warren-pg-speller", version = "0.1.1", default-features = false }
 
 [dependencies.pgrx-bench]
 version = "=0.19.2"
