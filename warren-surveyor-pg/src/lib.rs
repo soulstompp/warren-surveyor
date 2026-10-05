@@ -7,7 +7,17 @@
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
+mod budget;
+#[allow(dead_code)]
+mod conditions;
+mod leaves;
+#[allow(dead_code)]
+mod measure;
 mod options;
+mod price;
+mod query;
+mod round;
+mod size;
 mod writes;
 
 ::pgrx::pg_module_magic!(name, version);
@@ -15,6 +25,9 @@ mod writes;
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
+    size::init();
+    round::init();
+    price::init();
 }
 
 extension_sql!(
