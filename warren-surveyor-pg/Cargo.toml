@@ -7,6 +7,7 @@ license = "GPL-3.0-or-later"
 authors = ["Kenneth Allen Flegal"]
 description = "The surveyor for PostgreSQL, an index access method: it measures without digging"
 repository = "https://github.com/soulstompp/warren-surveyor"
+readme = "README.md"
 keywords = ["postgresql", "pgrx", "index", "planner"]
 categories = ["database"]
 rust-version = "1.96"
