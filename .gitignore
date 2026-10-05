@@ -1,0 +1,14 @@
+# Build output
+/target
+
+# Your own write-ups, in progress. Local only.
+notes/
+
+# Local settings and credentials.
+.env
+.idea/
+
+# `cargo pgrx regress` run output; the tracked halves are tests/pg_regress/sql and expected.
+*/tests/pg_regress/results
+*/tests/pg_regress/regression.diffs
+*/tests/pg_regress/regression.out

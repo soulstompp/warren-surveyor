@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "warren-surveyor-pg"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Kenneth Allen Flegal"]
+description = "The surveyor for PostgreSQL, an index access method: it measures without digging"
+repository = "https://github.com/soulstompp/warren-surveyor"
+keywords = ["postgresql", "pgrx", "index", "planner"]
+categories = ["database"]
+rust-version = "1.96"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19"]
+pg_test = []
+pg_bench = ["dep:pgrx-bench"]
+
+[dependencies]
+pgrx = "=0.19.2"
+
+[dependencies.pgrx-bench]
+version = "=0.19.2"
+optional = true
+
+[dev-dependencies]
+[dev-dependencies.postgres]
+version = "0.19"
+
+[dev-dependencies.pgrx-tests]
+version = "=0.19.2"

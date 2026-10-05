@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+comment = 'The surveyor, an index access method: it measures without digging'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'warren_surveyor_pg'
+relocatable = false
+superuser = true
+trusted = false
