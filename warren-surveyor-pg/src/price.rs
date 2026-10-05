@@ -58,6 +58,11 @@ pub(crate) const PAGE_IN_MEMORY: f64 = 0.047;
 /// and `random_page_cost` for the rest.
 static WALKED_LEAF_PAGE_COST: GucSetting<f64> = GucSetting::<f64>::new(-1.0);
 
+/// `warren_surveyor_pg.walked_leaf_page_cost` as it stands: below 0 where it is not set.
+pub(crate) fn walked_leaf_page_cost() -> f64 {
+    WALKED_LEAF_PAGE_COST.get()
+}
+
 /// `warren_surveyor_pg.planning_read_limit`: the most pages the surveyor reads while a statement is
 /// planned, below the pages of the tables the statement reads (`budget`); -1 sets no limit below
 /// them, and 0 reads none.
@@ -1838,5 +1843,361 @@ pub(crate) mod tests {
             assert_eq!(r.ours.tuples, 60000.0, "{r:?}");
             assert_eq!(r.ours.pages, r.index_pages, "{r:?}");
         }
+    }
+
+    /// Runs `f` with every drive taken to be busy for `share` of the time.
+    fn busy<T>(share: f64, f: impl FnOnce() -> T) -> T {
+        crate::drive::tests::BUSY_SHARE.set(Some(share));
+        let out = f();
+        crate::drive::tests::BUSY_SHARE.set(Some(0.0));
+        out
+    }
+
+    #[pg_test]
+    fn a_busy_drive_weighs_every_index_page_read_from_it() {
+        stock();
+        Spi::run(
+            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
+             SELECT pg_buffercache_evict_relation(indexrelid) FROM pg_index \
+             WHERE indrelid = 'stock'::regclass",
+        )
+        .unwrap();
+        let questions = questions();
+        let queries: Vec<&str> = questions.iter().map(|q| q.as_str()).collect();
+        let (random, sequential) = (setting("random_page_cost"), setting("seq_page_cost"));
+        let mut totals = Vec::new();
+        // planned with the page costs multiplied by the weight, a page in shared buffers at its price
+        for (share, heat) in [(0.0, 1.0), (0.5, 2.0), (0.75, 4.0)] {
+            let records = busy(share, || recorded(PAGES, &queries));
+            let (random, sequential) = (random * heat, sequential * heat);
+            let mut from_disk = 0;
+            for r in &records {
+                let (theirs, ours, per) = fetched(r);
+                if r.ours.resident.is_some_and(|s| ours * s < ours) {
+                    from_disk += 1;
+                }
+                let at =
+                    r.theirs[1] + own_pages(r, random, sequential, None) - theirs * random / per;
+                assert!(close(r.ours.total, at), "{share} {r:?}");
+            }
+            assert!(from_disk > 5, "{from_disk}");
+            totals.push(records.iter().map(|r| r.ours.total).sum::<f64>());
+        }
+        assert!(totals[0] < totals[1] && totals[1] < totals[2], "{totals:?}");
+    }
+
+    thread_local! {
+        static PATHS: RefCell<Vec<(String, f64)>> = const { RefCell::new(Vec::new()) };
+    }
+    static mut NEXT_PATHLIST: pg_sys::set_rel_pathlist_hook_type = None;
+
+    /// Records each path of the stock's relation once the hooks before it have run: what it is, and
+    /// its total price.
+    #[pg_guard]
+    unsafe extern "C-unwind" fn record_paths(
+        root: *mut pg_sys::PlannerInfo,
+        rel: *mut pg_sys::RelOptInfo,
+        rti: pg_sys::Index,
+        rte: *mut pg_sys::RangeTblEntry,
+    ) {
+        if let Some(next) = NEXT_PATHLIST {
+            next(root, rel, rti, rte);
+        }
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
+            || (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
+            || CStr::from_ptr(pg_sys::get_rel_name((*rte).relid)).to_bytes() != b"stock"
+        {
+            return;
+        }
+        for list in [(*rel).pathlist, (*rel).partial_pathlist] {
+            for p in cells(list) {
+                let path = p as *mut pg_sys::Path;
+                let index = match (*path).pathtype {
+                    pg_sys::NodeTag::T_IndexScan | pg_sys::NodeTag::T_IndexOnlyScan => {
+                        let i = (*(path as *mut pg_sys::IndexPath)).indexinfo;
+                        CStr::from_ptr(pg_sys::get_rel_name((*i).indexoid))
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                    _ => String::new(),
+                };
+                let kind = format!(
+                    "{:?} {index} parameterized={} workers={} keys={}",
+                    (*path).pathtype,
+                    !(*path).param_info.is_null(),
+                    (*path).parallel_workers,
+                    cells((*path).pathkeys).len()
+                );
+                PATHS.with(|s| s.borrow_mut().push((kind, (*path).total_cost)));
+            }
+        }
+    }
+
+    /// Each path of the stock's relation while `query` was planned after `settings`: what it is,
+    /// numbered among its kind, and its total price.
+    fn paths_of(settings: &str, query: &str) -> Vec<(String, f64)> {
+        PATHS.with(|s| s.borrow_mut().clear());
+        unsafe {
+            NEXT_PATHLIST = pg_sys::set_rel_pathlist_hook;
+            pg_sys::set_rel_pathlist_hook = Some(record_paths);
+        }
+        let planned = Spi::run(&format!("{settings}; EXPLAIN {query}"));
+        unsafe { pg_sys::set_rel_pathlist_hook = NEXT_PATHLIST };
+        Spi::run(
+            "RESET enable_seqscan; RESET enable_indexscan; RESET enable_bitmapscan; \
+             RESET enable_hashjoin; RESET enable_mergejoin; RESET parallel_setup_cost; \
+             RESET parallel_tuple_cost; RESET min_parallel_table_scan_size; \
+             RESET min_parallel_index_scan_size; RESET max_parallel_workers_per_gather",
+        )
+        .unwrap();
+        planned.unwrap_or_else(|e| panic!("{query}: {e}"));
+        let mut seen: Vec<(String, f64)> = Vec::new();
+        for (kind, total) in PATHS.with(|s| s.borrow().clone()) {
+            let n = seen.iter().filter(|(k, _)| k.starts_with(&kind)).count();
+            seen.push((format!("{kind} #{n} in {query}"), total));
+        }
+        seen
+    }
+
+    #[pg_test]
+    fn a_page_in_shared_buffers_costs_the_same_however_busy_the_drive() {
+        stock();
+        let random = setting("random_page_cost");
+        let walk = |share: f64| {
+            busy(share, || {
+                recorded(PAGES, &["SELECT id FROM stock WHERE id > 0"])
+            })
+            .into_iter()
+            .find(|r| r.index == "stock_pkey" && r.loop_count == 1.0 && r.quals == 1)
+            .unwrap_or_else(|| panic!("no walk of the primary key"))
+        };
+        for (share, heat) in [(0.0, 1.0), (0.5, 2.0), (0.75, 4.0)] {
+            let r = walk(share);
+            // every page in shared buffers, each at its price in memory, where the B-tree's own
+            // price takes the weighed page cost
+            assert_eq!(r.ours.resident, Some(1.0), "{r:?}");
+            let at = r.theirs[1] + r.ours.pages * PAGE_IN_MEMORY - r.theirs[4] * random * heat;
+            assert!(close(r.ours.total, at), "{share} {r:?}");
+        }
+    }
+
+    #[pg_test]
+    fn a_busy_drive_weighs_exactly_the_page_part_of_every_path_through_the_table() {
+        stock();
+        let parallel = "SET LOCAL parallel_setup_cost = 0; SET LOCAL parallel_tuple_cost = 0; \
+                        SET LOCAL min_parallel_table_scan_size = 0; \
+                        SET LOCAL min_parallel_index_scan_size = 0; \
+                        SET LOCAL max_parallel_workers_per_gather = 2";
+        let parallel_table = format!(
+            "{parallel}; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off"
+        );
+        let parallel_bitmap =
+            format!("{parallel}; SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off");
+        let ways = [
+            (
+                "SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off",
+                "SELECT * FROM stock WHERE lot = 5",
+            ),
+            (parallel_table.as_str(), "SELECT * FROM stock WHERE lot = 5"),
+            (
+                parallel_bitmap.as_str(),
+                "SELECT * FROM stock WHERE lot = 5",
+            ),
+            (
+                "SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off",
+                "SELECT * FROM stock WHERE lot = 5",
+            ),
+            (
+                "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off",
+                "SELECT * FROM stock WHERE shelf = 7",
+            ),
+            (
+                "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off",
+                "SELECT shelf, bin FROM stock WHERE shelf = 7",
+            ),
+            (
+                "SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off",
+                "SELECT s.bin FROM picks p JOIN stock s ON s.id = p.id",
+            ),
+        ];
+        let all = |share: f64, free: bool| {
+            Spi::run(if free {
+                "ALTER TABLESPACE pg_default SET (random_page_cost = 0, seq_page_cost = 0)"
+            } else {
+                "ALTER TABLESPACE pg_default RESET (random_page_cost, seq_page_cost)"
+            })
+            .unwrap();
+            busy(share, || {
+                ways.iter()
+                    .enumerate()
+                    .flat_map(|(w, (settings, query))| {
+                        paths_of(settings, query)
+                            .into_iter()
+                            .map(move |(k, t)| (format!("way {w}: {k}"), t))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        // each path at the page costs and with the pages free, the drive idle and half busy
+        let (priced, free) = (all(0.0, false), all(0.0, true));
+        let (priced_busy, free_busy) = (all(0.5, false), all(0.5, true));
+        let at = |paths: &[(String, f64)], kind: &str| {
+            paths.iter().find(|(k, _)| k == kind).map(|(_, t)| *t)
+        };
+        let mut weighed = Vec::new();
+        for (kind, total) in &priced {
+            let (Some(f), Some(pb), Some(fb)) = (
+                at(&free, kind),
+                at(&priced_busy, kind),
+                at(&free_busy, kind),
+            ) else {
+                continue;
+            };
+            let pages = total - f;
+            // the rest of the price stays, and the drive's part doubles
+            assert!((fb - f).abs() <= 1e-9 * f.max(1.0), "{kind}: {f} {fb}");
+            assert!(
+                (pb - fb - 2.0 * pages).abs() <= 1e-9 * pb.max(1.0),
+                "{kind}: {total} {f} {pb} {fb}"
+            );
+            if pages > 0.0 {
+                weighed.push(kind.clone());
+            }
+        }
+        for wanted in [
+            "T_SeqScan  parameterized=false workers=0",
+            "T_BitmapHeapScan  parameterized=false workers=0",
+            "T_IndexScan stock_shelf_bin parameterized=false",
+            "T_IndexOnlyScan stock_shelf_bin parameterized=false",
+            "T_IndexScan stock_pkey parameterized=true",
+        ] {
+            assert!(
+                weighed.iter().any(|k| k.contains(wanted)),
+                "{wanted}: {weighed:?}"
+            );
+        }
+        // parallel scans of the table
+        for wanted in ["T_SeqScan", "T_BitmapHeapScan"] {
+            assert!(
+                weighed
+                    .iter()
+                    .any(|k| k.contains(wanted) && !k.contains("workers=0")),
+                "{wanted}: {weighed:?}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn a_busy_drive_moves_the_choice_from_the_faster_plan_to_the_one_that_reads_less_from_it() {
+        // 60,000 rows written all-visible, its primary key out of shared buffers, a surveyor, and
+        // 3,000 picks of the first 300 rows
+        Spi::run(
+            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
+             CREATE TABLE lean (id int, pad int DEFAULT 0); \
+             COPY lean (id) FROM PROGRAM 'seq 1 60000' WITH (FREEZE); \
+             ALTER TABLE lean ADD PRIMARY KEY (id); \
+             CREATE INDEX lean_order ON lean USING surveyor (id); \
+             CREATE TABLE few AS SELECT 1 + g % 300 AS id FROM generate_series(1, 3000) g; \
+             ANALYZE lean; ANALYZE few; \
+             SELECT pg_buffercache_evict_relation('lean_pkey'); \
+             SET LOCAL max_parallel_workers_per_gather = 0; \
+             SET LOCAL enable_mergejoin = off; SET LOCAL enable_memoize = off",
+        )
+        .unwrap();
+        let query = "SELECT count(*) FROM few p JOIN lean l ON l.id = p.id";
+        let price = |plan: &str| -> f64 {
+            plan.lines()
+                .next()
+                .and_then(|l| l.split("..").nth(1))
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|r| r.parse().ok())
+                .unwrap_or_else(|| panic!("{plan}"))
+        };
+        let way = |share: f64, settings: &str| {
+            busy(share, || {
+                Spi::run(settings).unwrap();
+                let plan = texts(&format!("EXPLAIN {query}")).join("\n");
+                Spi::run("RESET enable_hashjoin; RESET enable_nestloop").unwrap();
+                plan
+            })
+        };
+        let chosen = |share: f64| {
+            let plan = way(share, "SELECT 1");
+            if plan.contains("Nested Loop") {
+                "lookups"
+            } else if plan.contains("Hash Join") {
+                "hash"
+            } else {
+                panic!("{plan}")
+            }
+        };
+        // idle, the lookups into the key, priced lower; busy, the hash join, which reads less from
+        // the drive
+        let (lookups, table) = (
+            way(0.0, "SET LOCAL enable_hashjoin = off"),
+            way(0.0, "SET LOCAL enable_nestloop = off"),
+        );
+        assert!(price(&lookups) < price(&table), "{lookups}\n{table}");
+        assert_eq!(chosen(0.0), "lookups");
+        assert_eq!(chosen(0.75), "hash");
+        assert_eq!(chosen(0.9), "hash");
+    }
+
+    #[pg_test]
+    fn a_busy_drive_chooses_the_scan_that_reads_fewer_pages_from_it() {
+        // 60,000 rows written all-visible, a primary key of fewer pages than the table out of shared
+        // buffers, and a surveyor
+        Spi::run(
+            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
+             CREATE TABLE lean (id int, pad int DEFAULT 0); \
+             COPY lean (id) FROM PROGRAM 'seq 1 60000' WITH (FREEZE); \
+             ALTER TABLE lean ADD PRIMARY KEY (id); \
+             CREATE INDEX lean_order ON lean USING surveyor (id); \
+             ANALYZE lean; \
+             SELECT pg_buffercache_evict_relation('lean_pkey'); \
+             SET LOCAL max_parallel_workers_per_gather = 0",
+        )
+        .unwrap();
+        let query = "SELECT count(*) FROM lean WHERE id > 0";
+        let plan = |share: f64, settings: &str| {
+            busy(share, || {
+                Spi::run(settings).unwrap();
+                let plan = texts(&format!("EXPLAIN {query}")).join("\n");
+                Spi::run(
+                    "RESET enable_seqscan; RESET enable_indexscan; RESET enable_indexonlyscan",
+                )
+                .unwrap();
+                plan
+            })
+        };
+        let price = |plan: &str| -> f64 {
+            plan.lines()
+                .next()
+                .and_then(|l| l.split("..").nth(1))
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|r| r.parse().ok())
+                .unwrap_or_else(|| panic!("{plan}"))
+        };
+        // idle, the scan of the table, priced lower
+        assert!(plan(0.0, "SELECT 1").contains("Seq Scan on lean"));
+        // busy, the scan of the key, which reads fewer pages from the drive, priced lower and chosen
+        let (table, key) = (
+            plan(
+                0.75,
+                "SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off",
+            ),
+            plan(0.75, "SET LOCAL enable_seqscan = off"),
+        );
+        assert!(price(&key) < price(&table), "{key}\n{table}");
+        let chosen = plan(0.75, "SELECT 1");
+        assert!(
+            chosen.contains("Index Only Scan using lean_pkey"),
+            "{chosen}\n{key}\n{table}"
+        );
+        assert_eq!(price(&chosen), price(&key), "{chosen}\n{key}");
+    }
+
+    fn texts(sql: &str) -> Vec<String> {
+        crate::tests::texts(sql)
     }
 }

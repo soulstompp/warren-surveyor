@@ -74,6 +74,7 @@ pub(crate) fn forget_all() {
     crate::closure::forget_from(0);
     crate::size::forget_from(0);
     crate::price::forget();
+    crate::drive::forget();
     crate::budget::forget();
 }
 
@@ -114,7 +115,16 @@ unsafe fn planned(
     if outermost {
         crate::budget::begin(parse);
     }
-    plan()
+    let heat = if outermost && !pg_sys::IsInParallelMode() {
+        crate::drive::statement_weight(parse)
+    } else {
+        1.0
+    };
+    if heat > 1.0 {
+        crate::drive::planned_weighed(heat, plan)
+    } else {
+        plan()
+    }
 }
 
 #[cfg(not(feature = "pg19"))]
