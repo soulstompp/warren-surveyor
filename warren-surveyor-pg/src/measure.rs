@@ -1417,6 +1417,35 @@ pub(crate) unsafe fn steps(
     Some((Some(found), pages))
 }
 
+/// The share of the steps from one leaf of the B-tree `index` to the next in key order that go to
+/// the next block, read from the downlinks of one page just above the leaves, reached from the root
+/// by the middle downlink of each page, and the pages read. None where the index is not one this
+/// read knows, its root is a leaf, or a page on the way down is not of the level its parent names
+/// or VACUUM has deleted it since.
+pub(crate) unsafe fn leaf_order(index: pg_sys::Relation) -> Option<(f64, u32)> {
+    let (_metapage, meta) = metapage(index)?;
+    if meta.fastroot == P_NONE || meta.fastlevel == 0 {
+        return None;
+    }
+    let mut page = read_at(index, meta.fastroot, meta.fastlevel)?;
+    let mut pages = 2;
+    for level in (1..meta.fastlevel).rev() {
+        let (first, last) = (page.first_data(), page.last());
+        let middle = first + (last.saturating_sub(first)) / 2;
+        page = read_at(index, page.child(middle)?, level)?;
+        pages += 1;
+    }
+    let leaves = (page.first_data()..=page.last())
+        .map(|offset| page.child(offset))
+        .collect::<Option<Vec<pg_sys::BlockNumber>>>()?;
+    let steps = leaves.len().saturating_sub(1);
+    if steps == 0 {
+        return Some((1.0, pages));
+    }
+    let next = leaves.windows(2).filter(|w| w[1] == w[0] + 1).count();
+    Some((next as f64 / steps as f64, pages))
+}
+
 /// The first and last values other than NULL of the leading column of the B-tree `index`, where
 /// its type counts its values, read from the entries at the two ends of the key: the smaller and
 /// the larger, and the pages read. None where the read would read more than `most` pages.
@@ -2131,6 +2160,36 @@ mod tests {
             uneven: false,
         };
         assert!(near(leaf.rows_within(all, || Some(0.5)), 7.0));
+    }
+
+    #[pg_test]
+    fn the_leaves_order_on_disk_is_read_from_one_page_above_them() {
+        // the same keys built whole, and written row by row in scattered order with the key in place
+        wide("built", "", 30000);
+        Spi::run(
+            "CREATE INDEX built_k ON built (k); \
+             CREATE TABLE written (k text COLLATE \"C\", v int); \
+             CREATE INDEX written_k ON written (k); \
+             INSERT INTO written SELECT k, v FROM built ORDER BY md5(v::text)",
+        )
+        .unwrap();
+        for (index, ordered) in [("built_k", true), ("written_k", false)] {
+            let rel = open(index);
+            let height = unsafe {
+                let metapage = read(rel, 0);
+                (*(pg_sys::PageGetContents(metapage.ptr()) as *const Meta)).fastlevel
+            };
+            assert!(height >= 2, "{index}: {height}");
+            let (share, pages) = unsafe { super::leaf_order(rel) }.expect("a B-tree's order");
+            // the metapage, and a page of each level down to the one above the leaves
+            assert_eq!(pages, height + 1, "{index}");
+            if ordered {
+                assert!(share > 0.9, "{index}: {share}");
+            } else {
+                assert!(share < 0.2, "{index}: {share}");
+            }
+            unsafe { pg_sys::index_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
+        }
     }
 
     /// The heap address of each row `sql` names, as one number: its block, then its place on the

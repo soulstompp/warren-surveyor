@@ -73,6 +73,7 @@ pub(crate) fn forget_all() {
     crate::leaves::forget();
     crate::closure::forget_from(0);
     crate::size::forget_from(0);
+    crate::price::forget();
     crate::budget::forget();
 }
 

@@ -2189,6 +2189,33 @@ mod tests {
         assert_eq!(distinct, 40.0);
     }
 
+    #[pg_test]
+    fn common_values_holding_every_value_of_a_column_sum_with_its_nulls_to_one() {
+        crate::price::tests::stock();
+        let table = Spi::get_one::<pg_sys::Oid>("SELECT 'stock'::regclass::oid")
+            .unwrap()
+            .unwrap()
+            .to_u32();
+        // the shelf's 50 values and no NULLs; the lot's 13 values and the NULLs of every 40th row;
+        // each asked for in a statement of its own, as the shelf's list alone takes nearly all of
+        // the half of the table's pages that statistics may read
+        for (attnum, values, cond) in [(2, 50, "shelf = 7"), (4, 13, "lot = 3")] {
+            let seen = handed(&format!("SELECT id FROM stock WHERE {cond} OR id < 0"));
+            let column = seen
+                .iter()
+                .find(|h| h.of == (table, attnum))
+                .unwrap_or_else(|| panic!("{attnum}: {seen:?}"))
+                .clone();
+            assert_eq!(column.common.len(), values, "{column:?}");
+            let sum: f64 = column.common.iter().map(|c| c.1).sum();
+            assert!(
+                (sum + column.nulls - 1.0).abs() <= 1e-5,
+                "{sum} and {} NULLs, {column:?}",
+                column.nulls
+            );
+        }
+    }
+
     /// A realm of 300 themes, 30 roots each the parent of 9 others, with a B-tree on the parent and
     /// a surveyor; and about 106,000 goods of those themes, a few themes holding thousands and most
     /// a few dozen, with a B-tree on the theme and a surveyor. ANALYZE names 10 themes in its most

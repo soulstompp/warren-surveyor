@@ -3,6 +3,11 @@
 
 //! warren_surveyor_pg: the surveyor, an index that reads a table's other indexes while a statement
 //! is planned.
+//!
+//! A surveyor holds no entries and is never scanned. A table that carries one is planned with the
+//! reads it turns on: the table's rows under its constant conditions, measured by its indexes while
+//! planning; the size of a WITH RECURSIVE query over the table, read while planning; a grouping at
+//! one value of a leading column, made by hashing; and the price of the table's B-trees.
 
 use pgrx::pg_sys;
 use pgrx::prelude::*;

@@ -221,6 +221,11 @@ impl Read {
     }
 }
 
+/// The conditions in `a` and in `b` are the same.
+fn same(a: &[*mut pg_sys::RestrictInfo], b: &[*mut pg_sys::RestrictInfo]) -> bool {
+    a.iter().all(|c| b.contains(c)) && b.iter().all(|c| a.contains(c))
+}
+
 /// The conditions `index` of `rel` would hold, other than those in `counted`, read from the
 /// conditions alone, and the key columns its read would step through.
 unsafe fn holds(
@@ -298,6 +303,25 @@ pub(crate) unsafe fn measure_on_leaves(
     (held, leaves)
 }
 
+/// The leaves the B-tree `index` of `rel` measured the conditions `clauses` on in this round,
+/// where it measured exactly them; none where it was not read for them.
+pub(crate) fn measured_leaves(
+    rel: *mut pg_sys::RelOptInfo,
+    index: *mut pg_sys::IndexOptInfo,
+    clauses: &[*mut pg_sys::RestrictInfo],
+) -> Option<f64> {
+    let oid = unsafe { (*index).indexoid };
+    MEASURES.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|e| e.rel == rel as usize && e.index == oid)
+            .find_map(|e| match &e.held {
+                Some(h) if same(&h.clauses, clauses) => e.leaves,
+                _ => None,
+            })
+    })
+}
+
 /// What the indexes of `rel` measured of its constant conditions, measured once in the round; none
 /// where no index holds a condition.
 pub(crate) unsafe fn relation(
@@ -322,6 +346,24 @@ pub(crate) unsafe fn relation(
         RELATIONS.with(|r| r.borrow_mut().push((depth, rel as usize, read.clone())));
     }
     read
+}
+
+/// The share of `rel`'s rows the round's measure of `rel` gives the conditions `clauses`, where it
+/// counted exactly them: with one index, or with all of them together.
+pub(crate) unsafe fn counted_share(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    clauses: &[*mut pg_sys::RestrictInfo],
+) -> Option<f64> {
+    let am = surveyor_am();
+    if am == pg_sys::InvalidOid {
+        return None;
+    }
+    let read = relation(root, rel, am)?;
+    if let Some(part) = read.parts.iter().find(|p| same(&p.0, clauses)) {
+        return Some(part.1);
+    }
+    same(&read.counted(), clauses).then(|| read.share())
 }
 
 /// The rows of `rel` under its constant conditions, measured by its indexes; none where no index
