@@ -8,6 +8,7 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 
 mod budget;
+mod carried;
 #[allow(dead_code)]
 mod conditions;
 #[allow(dead_code)]
@@ -18,6 +19,7 @@ mod leaves;
 #[allow(dead_code)]
 mod measure;
 mod options;
+mod overlap;
 #[cfg(any(test, feature = "pg_test"))]
 mod planned;
 mod price;

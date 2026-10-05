@@ -376,6 +376,29 @@ pub(crate) unsafe fn fits_read(needed: f64, what: impl FnOnce() -> String) -> bo
     false
 }
 
+/// Draws `pages` read by PostgreSQL's own scan or executor for the read `what`, which stopped where
+/// `stopped`: noted at DEBUG1, with the pages it read and those that were left when it started.
+pub(crate) unsafe fn spend(
+    pages: u64,
+    stopped: bool,
+    left_before: u32,
+    what: impl FnOnce() -> String,
+) {
+    let noted = with(|b| {
+        b.take(pages);
+        let limit = b.counted().limit;
+        if !stopped {
+            return None;
+        }
+        let what = what();
+        b.first(&what, true).then_some((what, limit))
+    })
+    .flatten();
+    if let Some((what, limit)) = noted {
+        note_stop(&what, pages, left_before as u64, limit);
+    }
+}
+
 /// The name of the index `index` and of the table it is on.
 pub(crate) unsafe fn index_name(index: pg_sys::Oid) -> String {
     let table = pg_sys::IndexGetRelation(index, true);

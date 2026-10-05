@@ -29,6 +29,7 @@
 //! whose predicate the planner proved from the question's own conditions.
 
 use crate::conditions::{self, Held};
+use crate::overlap::{self, Together};
 use crate::query::{cells, surveyed, surveyor_am};
 use crate::round;
 use crate::{gin, gist};
@@ -133,12 +134,32 @@ unsafe extern "C-unwind" fn pathlist(
         let rows = read.rows(root, rel);
         rewrite(root, rel, rows);
         if pg_sys::message_level_is_interesting(pg_sys::DEBUG1 as i32) {
+            let together: String = read
+                .together
+                .iter()
+                .map(|t| {
+                    format!(
+                        ", {} of them counted together {} at {:.0} rows ({} pages)",
+                        t.parts.len(),
+                        if t.on_entries && t.every_leaf {
+                            "on every leaf of one index's block"
+                        } else if t.on_entries {
+                            "on five leaves of one index's block"
+                        } else {
+                            "by their rows' addresses"
+                        },
+                        t.share * (*rel).tuples,
+                        t.pages
+                    )
+                })
+                .collect();
             debug1!(
-                "surveyor: {} measured at {:.0} rows of {:.0} by {} (pages read {}); the planner had {:.0}",
+                "surveyor: {} measured at {:.0} rows of {:.0} by {}{} (pages read {}); the planner had {:.0}",
                 name((*rte).relid),
                 rows,
                 (*rel).tuples,
                 read.indexes.join(", "),
+                together,
                 read.pages,
                 before
             );
@@ -161,6 +182,7 @@ unsafe fn name(relid: pg_sys::Oid) -> String {
 #[derive(Clone)]
 pub(crate) struct Read {
     parts: Vec<(Vec<*mut pg_sys::RestrictInfo>, f64)>,
+    together: Vec<Together>,
     pages: u32,
     indexes: Vec<String>,
 }
@@ -178,7 +200,12 @@ impl Read {
     /// share in all of the conditions of each group of indexes read together, times each other
     /// index's share.
     fn share(&self) -> f64 {
-        self.parts.iter().map(|p| p.1).product()
+        let together = |at: usize| self.together.iter().any(|t| t.parts.contains(&at));
+        let apart: f64 = (0..self.parts.len())
+            .filter(|&at| !together(at))
+            .map(|at| self.parts[at].1)
+            .product();
+        apart * self.together.iter().map(|t| t.share).product::<f64>()
     }
 
     /// The relation's rows: the table's, times the indexes' share, times the planner's own share of
@@ -316,9 +343,11 @@ unsafe fn measured(
     let mut counted: Vec<*mut pg_sys::RestrictInfo> = Vec::new();
     let mut read = Read {
         parts: Vec::new(),
+        together: Vec::new(),
         pages: 0,
         indexes: Vec::new(),
     };
+    let mut from = Vec::new();
     loop {
         // the index holding the most conditions not yet counted, of those the one stepping through
         // the fewest key columns
@@ -349,11 +378,19 @@ unsafe fn measured(
             .push((h.clauses.clone(), (h.rows / tuples).clamp(0.0, 1.0)));
         read.pages += h.pages;
         read.indexes.push(name((*index).indexoid));
+        from.push(index);
         counted.extend(h.clauses.iter().copied());
     }
     if read.parts.is_empty() {
         return None;
     }
+    let parts: Vec<overlap::Part> = from
+        .iter()
+        .zip(&read.parts)
+        .map(|(&index, (clauses, share))| (index, clauses.as_slice(), *share))
+        .collect();
+    read.together = overlap::together(root, rel, &parts);
+    read.pages += read.together.iter().map(|t| t.pages).sum::<u32>();
     Some(read)
 }
 

@@ -18,10 +18,17 @@
 //! and a `LIKE` whose pattern holds no letter that changes with case, is measured by the fewest
 //! rows any trigram it requires holds; any other `LIKE` is left to the planner.
 //!
+//! For the rows in all of a relation's conditions (`overlap`), a condition's rows are also read by
+//! their addresses: each key's list beside its entry, or every leaf of its tree, and of those, the
+//! addresses the operator class's consistent function keeps, put to it as GIN's own scan puts them.
+//! Each key's list keeps only the addresses another index found as it is read, and the read stops
+//! once the addresses it holds would pass what `work_mem` holds.
+//!
 //! The read stops once its pages would pass the pages of the table, or what is left of the
 //! statement's planning-read budget (`budget`), and its conditions are left to the planner.
 
 use crate::conditions::{compares_as, Held};
+use crate::overlap::Room;
 use crate::reading::{address, block_of, on_first_column, read, support_name, PageCopy};
 use pgrx::pg_sys;
 use std::cmp::Ordering;
@@ -34,10 +41,20 @@ const GIN_META: u16 = 1 << 3;
 const GIN_COMPRESSED: u16 = 1 << 7;
 /// The count of listed rows an entry carries when its rows are in a tree.
 const IN_A_TREE: u16 = 0xffff;
+/// The bit of an entry's list offset that says its list is compressed.
+const COMPRESSED_LIST: u32 = 1 << 31;
+/// The bytes of one address: its block's two halves, then its place on the block.
+const ITEM_POINTER: usize = 6;
+/// The bits a compressed list keeps for an address's place on its block.
+const PLACE_BITS: u32 = 11;
 const NORMAL_KEY: i8 = 0;
 const NULL_ITEM: i8 = 3;
 const COMPARE_PROC: u16 = 1;
 const EXTRACT_QUERY_PROC: i16 = 3;
+const CONSISTENT_PROC: u16 = 4;
+const TRICONSISTENT_PROC: u16 = 6;
+/// What a ternary consistent function answers for a row that does not match.
+const GIN_FALSE: usize = 0;
 const INDEX_NULL_MASK: u16 = 0x8000;
 /// `tsvector_ops`'s `@@` and `@@@`.
 const TEXT_MATCH: [i32; 2] = [1, 2];
@@ -268,6 +285,160 @@ impl Gin {
         })
     }
 
+    /// The addresses of the rows the index lists for `key`, of those in `among` where they are
+    /// given, in the order of the addresses: the list beside its entry, or every leaf of its tree.
+    /// None where the read has read its most, or where the addresses held, `held` beside them,
+    /// would pass `room`.
+    unsafe fn addresses(
+        &mut self,
+        key: &Key,
+        among: Option<&[u64]>,
+        held: usize,
+        room: &mut Room,
+    ) -> Option<Vec<u64>> {
+        let Some((page, at)) = self.entry(key)? else {
+            return Some(Vec::new());
+        };
+        let tuple = page.item(at);
+        let mut into = Gathered {
+            found: Vec::new(),
+            among,
+            held,
+            room,
+        };
+        if (*tuple).t_tid.ip_posid == IN_A_TREE {
+            self.tree_addresses(block_of(tuple), &mut into)?;
+        } else {
+            listed_addresses(tuple, &mut into)?;
+        }
+        Some(into.found)
+    }
+
+    /// The addresses every leaf of the posting tree whose root is `root` holds, from its first leaf
+    /// along to its last, gathered `into`. None where the read has read its most, or where the
+    /// addresses gathered would pass the room.
+    unsafe fn tree_addresses(
+        &mut self,
+        root: pg_sys::BlockNumber,
+        into: &mut Gathered,
+    ) -> Option<()> {
+        let mut page = self.page(root)?;
+        while !is_leaf(&page) {
+            let Some(&first) = children(&page).first() else {
+                return Some(());
+            };
+            page = self.page(first)?;
+        }
+        loop {
+            let opaque = page.special::<pg_sys::GinPageOpaqueData>();
+            let (flags, right) = (opaque.flags, opaque.rightlink);
+            if flags & GIN_DELETED == 0 {
+                leaf_addresses(&page, into)?;
+            }
+            if right == pg_sys::InvalidBlockNumber {
+                return Some(());
+            }
+            page = self.page(right)?;
+        }
+    }
+
+    /// The addresses the operator class's consistent function keeps for the condition of
+    /// `strategy` against `query`: of the addresses `among` where they are given, else of every
+    /// address a key the condition asks for lists. Each key's list keeps only the addresses in
+    /// `among` as it is read. Each address is put to the function as GIN's own scan puts it, with
+    /// the keys that list it, where at least one does. None where the condition asks for no key, a
+    /// partial match, a NULL key or every row, where the read has read its most, or where the
+    /// addresses held, `held` beside the keys' lists and those kept, would pass `room`.
+    pub(crate) unsafe fn kept(
+        &mut self,
+        strategy: i32,
+        query: pg_sys::Datum,
+        among: Option<&[u64]>,
+        held: usize,
+        room: &mut Room,
+    ) -> Option<Vec<u64>> {
+        let extract = pg_sys::index_getprocinfo(self.index, 1, EXTRACT_QUERY_PROC as u16);
+        let asked = extraction(extract, self.collation, strategy, query)?;
+        if asked.mode != pg_sys::GIN_SEARCH_MODE_DEFAULT as i32 || asked.partial || asked.null {
+            return None;
+        }
+        let boolean = pg_sys::index_getprocid(self.index, 1, CONSISTENT_PROC) != pg_sys::InvalidOid;
+        let ternary =
+            pg_sys::index_getprocid(self.index, 1, TRICONSISTENT_PROC) != pg_sys::InvalidOid;
+        let consistent = match (boolean, ternary) {
+            (true, _) => pg_sys::index_getprocinfo(self.index, 1, CONSISTENT_PROC),
+            (false, true) => pg_sys::index_getprocinfo(self.index, 1, TRICONSISTENT_PROC),
+            (false, false) => return None,
+        };
+        let mut lists: Vec<Vec<u64>> = Vec::with_capacity(asked.keys.len());
+        let mut listed = held;
+        for k in &asked.keys {
+            let list = self.addresses(&Key::value(*k), among, listed, room)?;
+            listed += list.len();
+            lists.push(list);
+        }
+        let n = lists.len();
+        let categories = vec![NORMAL_KEY; n];
+        let mut check = vec![0u8; n];
+        let mut next = vec![0usize; n];
+        let mut recheck = false;
+        let mut kept = Vec::new();
+        // each address any key lists, in order, with the keys that list it: the lists walked side
+        // by side, none of them copied
+        while let Some(address) = lists
+            .iter()
+            .zip(&next)
+            .filter_map(|(list, &at)| list.get(at))
+            .min()
+            .copied()
+        {
+            for ((c, list), at) in check.iter_mut().zip(&lists).zip(next.iter_mut()) {
+                let lists_it = list.get(*at) == Some(&address);
+                *c = lists_it as u8;
+                *at += lists_it as usize;
+            }
+            let keeps = if boolean {
+                pg_sys::FunctionCall8Coll(
+                    consistent,
+                    self.collation,
+                    pg_sys::Datum::from(check.as_mut_ptr()),
+                    pg_sys::Datum::from(strategy as u16 as usize),
+                    query,
+                    pg_sys::Datum::from(n as u32 as usize),
+                    pg_sys::Datum::from(asked.extra),
+                    pg_sys::Datum::from(&mut recheck as *mut bool),
+                    pg_sys::Datum::from(asked.values),
+                    pg_sys::Datum::from(categories.as_ptr()),
+                )
+                .value()
+                    & 0xff
+                    != 0
+            } else {
+                pg_sys::FunctionCall7Coll(
+                    consistent,
+                    self.collation,
+                    pg_sys::Datum::from(check.as_mut_ptr()),
+                    pg_sys::Datum::from(strategy as u16 as usize),
+                    query,
+                    pg_sys::Datum::from(n as u32 as usize),
+                    pg_sys::Datum::from(asked.extra),
+                    pg_sys::Datum::from(asked.values),
+                    pg_sys::Datum::from(categories.as_ptr()),
+                )
+                .value()
+                    & 0xff
+                    != GIN_FALSE
+            };
+            if keeps {
+                if !room.fits((listed + kept.len() + 1) as f64) {
+                    return None;
+                }
+                kept.push(address);
+            }
+        }
+        Some(kept)
+    }
+
     /// The rows of the posting tree whose root is `root`, from its root, its first leaf, a leaf in
     /// its middle and its last leaf. A level under a level of more than two pages is counted from
     /// the first, the middle and the last page of the level above it in the same way. None where the
@@ -412,6 +583,111 @@ unsafe fn address_at(at: *const u8) -> u64 {
     let lo = std::ptr::read_unaligned(at.add(2) as *const u16) as u32;
     let place = std::ptr::read_unaligned(at.add(4) as *const u16);
     address((hi << 16) | lo, place)
+}
+
+/// The addresses a read of a key's list gathers: those in `among` where it is given, while they and
+/// the `held` addresses held beside them stay within `room`.
+struct Gathered<'a, 'b> {
+    found: Vec<u64>,
+    among: Option<&'a [u64]>,
+    held: usize,
+    room: &'b mut Room,
+}
+
+impl Gathered<'_, '_> {
+    /// Gathers `address` where `among` holds it; none where it would pass the room.
+    fn push(&mut self, address: u64) -> Option<()> {
+        if self
+            .among
+            .is_some_and(|among| among.binary_search(&address).is_err())
+        {
+            return Some(());
+        }
+        if !self.room.fits((self.held + self.found.len() + 1) as f64) {
+            return None;
+        }
+        self.found.push(address);
+        Some(())
+    }
+}
+
+/// The addresses of the list beside an entry tuple, gathered `into`; none where they would pass
+/// its room.
+unsafe fn listed_addresses(tuple: pg_sys::IndexTuple, into: &mut Gathered) -> Option<()> {
+    let n = (*tuple).t_tid.ip_posid as usize;
+    let word = block_of(tuple);
+    let at = (tuple as *const u8).add((word & !COMPRESSED_LIST) as usize);
+    if word & COMPRESSED_LIST == 0 {
+        for i in 0..n {
+            into.push(address_at(at.add(i * ITEM_POINTER)))?;
+        }
+    } else if n > 0 {
+        let bytes = std::ptr::read_unaligned(at.add(6) as *const u16) as usize;
+        decode(at, at.add(SEGMENT_HEADER + bytes), into)?;
+    }
+    Some(())
+}
+
+/// The addresses a leaf of a posting tree holds, gathered `into`; none where they would pass its
+/// room.
+unsafe fn leaf_addresses(page: &PageCopy, into: &mut Gathered) -> Option<()> {
+    let opaque = page.special::<pg_sys::GinPageOpaqueData>();
+    let start = page.contents().add(RIGHT_BOUND);
+    if opaque.flags & GIN_COMPRESSED == 0 {
+        for i in 0..opaque.maxoff as usize {
+            into.push(address_at(start.add(i * ITEM_POINTER)))?;
+        }
+        return Some(());
+    }
+    let end = (page.ptr() as *const u8).add(page.lower());
+    decode(start, end, into)
+}
+
+/// The addresses GIN's compressed lists from `at` to `end` hold, gathered `into`: each list its
+/// first address, then the step from each address to the next in GIN's variable-length encoding,
+/// over the address read as its block, then its place in 11 bits. None where they would pass its
+/// room.
+unsafe fn decode(mut at: *const u8, end: *const u8, into: &mut Gathered) -> Option<()> {
+    let packed = |address: u64| ((address >> 16) << PLACE_BITS) | (address & 0xffff);
+    let unpacked = |n: u64| {
+        address(
+            (n >> PLACE_BITS) as pg_sys::BlockNumber,
+            (n & ((1 << PLACE_BITS) - 1)) as pg_sys::OffsetNumber,
+        )
+    };
+    while at.add(SEGMENT_HEADER) <= end {
+        let first = address_at(at);
+        into.push(first)?;
+        let bytes = std::ptr::read_unaligned(at.add(6) as *const u16) as usize;
+        let mut p = at.add(SEGMENT_HEADER);
+        let stop = p.add(bytes);
+        let mut n = packed(first);
+        while p < stop {
+            n += varbyte(&mut p);
+            into.push(unpacked(n))?;
+        }
+        at = at.add(SEGMENT_HEADER + ((bytes + 1) & !1));
+    }
+    Some(())
+}
+
+/// One number of GIN's variable-length encoding at `p`, moving `p` past it: seven bits a byte
+/// while the byte's high bit is set, and the seventh byte whole.
+unsafe fn varbyte(p: &mut *const u8) -> u64 {
+    let mut n = 0u64;
+    for i in 0..7 {
+        let c = **p as u64;
+        *p = p.add(1);
+        if i == 6 {
+            n |= c << 42;
+            break;
+        }
+        n |= (c & 0x7f) << (7 * i);
+        if c & 0x80 == 0 {
+            break;
+        }
+    }
+    n
 }
 
 /// The keys the operator class extracts from `query` for `strategy`, as a scan of the index would
