@@ -13,6 +13,12 @@
 //! counted when the first read asks what is left. `warren_surveyor_pg.planning_read_limit` lowers
 //! the budget, and at 0 no index page is read while planning.
 //!
+//! The reads that answer the planner's requests for column statistics draw at most half of the
+//! budget, half of it as the setting lowers it. The planner asks for statistics before it measures
+//! a table's conditions, and a statistics read measuring each of a column's values could otherwise
+//! spend the whole budget; the conditions' read and every other read keep the rest, and may use
+//! whatever of the whole is left.
+//!
 //! Each index page read draws one page, found in shared buffers or read in. A B-tree's own scan of
 //! the rows' addresses matched across indexes, and the run of a recursive query, draw the pages
 //! PostgreSQL counts for them, and stop once those pass what is left. A read whose size is known
@@ -56,6 +62,23 @@ thread_local! {
     /// Outside a round, the planning one of the surveyor's hooks runs for: its planner's global
     /// state, while the hook runs; 0 otherwise.
     static PLANNING: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A reading of the planner's column statistics: while one lasts, every page read draws on the
+/// statistics' half of the budget as well as on the whole.
+pub(crate) struct Statistics;
+
+impl Statistics {
+    pub(crate) fn enter() -> Statistics {
+        STATISTICS.set(STATISTICS.get() + 1);
+        Statistics
+    }
+}
+
+impl Drop for Statistics {
+    fn drop(&mut self) {
+        STATISTICS.set(STATISTICS.get().saturating_sub(1));
+    }
 }
 
 /// Whether the planner's column statistics are being read.
@@ -615,12 +638,51 @@ unsafe extern "C-unwind" fn tables_walker(node: *mut pg_sys::Node, context: *mut
 #[pgrx::pg_schema]
 pub(crate) mod tests {
     use pgrx::prelude::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::CStr;
 
     thread_local! {
         /// The pages drawn while the last statement was planned, and its budget where it was
         /// counted.
         pub(crate) static LAST: Cell<Option<(u64, Option<u64>)>> = const { Cell::new(None) };
+        /// The surveyor's notes, while a test keeps them.
+        static NOTES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+    static mut NEXT_EMIT: pg_sys::emit_log_hook_type = None;
+
+    /// Keeps each of the surveyor's notes as it goes to the server's log.
+    #[pg_guard]
+    unsafe extern "C-unwind" fn keep_note(edata: *mut pg_sys::ErrorData) {
+        if let Some(next) = NEXT_EMIT {
+            next(edata);
+        }
+        if edata.is_null() || (*edata).message.is_null() {
+            return;
+        }
+        let text = CStr::from_ptr((*edata).message).to_string_lossy();
+        if text.starts_with("surveyor:") {
+            NOTES.with(|n| {
+                if let Some(n) = n.borrow_mut().as_mut() {
+                    n.push(text.into_owned());
+                }
+            });
+        }
+    }
+
+    /// The surveyor's DEBUG1 notes while `query` is planned.
+    fn notes(query: &str) -> Vec<String> {
+        NOTES.with(|n| *n.borrow_mut() = Some(Vec::new()));
+        unsafe {
+            NEXT_EMIT = pg_sys::emit_log_hook;
+            pg_sys::emit_log_hook = Some(keep_note);
+        }
+        let planned = Spi::run(&format!(
+            "SET LOCAL log_min_messages = debug1; EXPLAIN {query}"
+        ));
+        unsafe { pg_sys::emit_log_hook = NEXT_EMIT };
+        Spi::run("RESET log_min_messages").unwrap();
+        planned.unwrap_or_else(|e| panic!("{query}: {e}"));
+        NOTES.with(|n| n.borrow_mut().take().unwrap_or_default())
     }
 
     /// `f`, a test's own look at what a read measures while a statement is planned, run outside the
@@ -766,6 +828,48 @@ pub(crate) mod tests {
             assert_eq!(index_pages(q, "lanes_lane_slot"), 0, "{q}");
             assert_eq!(drawn(q).0, 0, "{q}");
         }
+    }
+
+    #[pg_test]
+    fn a_read_the_planning_read_limit_stops_partway_leaves_postgresqls_estimate() {
+        lanes();
+        let query = "SELECT id FROM lanes WHERE lane = 1 AND slot = 6";
+        let own = planned_rows(query);
+        Spi::run("CREATE INDEX lanes_order ON lanes USING surveyor (id)").unwrap();
+        let measured = planned_rows(query);
+        assert!(measured > 4.0 * own, "{measured} measured, {own} planned");
+        // two pages: the B-tree's metapage and its root, short of any leaf
+        Spi::run("SET LOCAL warren_surveyor_pg.planning_read_limit = 2").unwrap();
+        assert_eq!(planned_rows(query), own);
+        assert_eq!(index_pages(query, "lanes_lane_slot"), 2);
+        assert_eq!(drawn(query), (2, Some(2)));
+    }
+
+    #[pg_test]
+    fn the_statistics_read_draws_at_most_half_the_budget_and_leaves_the_rest_to_the_conditions() {
+        // the category's statistics, asked for before its condition is measured, measure each of
+        // its 30 values, a read that would spend the table's pages; the 15th category lies on one
+        // leaf
+        crate::conditions::tests::listed();
+        let query = "SELECT id FROM listed WHERE cat = 15";
+        let counted = Spi::get_one::<i64>("SELECT count(*) FROM listed WHERE cat = 15")
+            .unwrap()
+            .unwrap() as f64;
+        Spi::run("CREATE INDEX listed_order ON listed USING surveyor (id)").unwrap();
+        let seen = notes(query);
+        assert!(
+            seen.iter().any(|n| n.starts_with(
+                "surveyor: listed_cat_id on listed: statistics read stopped at half the \
+                 planning-read limit"
+            )),
+            "{seen:?}"
+        );
+        assert_eq!(planned_rows(query), counted, "{seen:?}");
+        let (drawn, limit) = drawn(query);
+        assert!(
+            limit.is_some_and(|l| drawn <= l),
+            "{drawn} drawn of {limit:?}"
+        );
     }
 
     #[pg_test(

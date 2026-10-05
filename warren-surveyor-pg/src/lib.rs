@@ -37,6 +37,7 @@ mod writes;
 pub extern "C-unwind" fn _PG_init() {
     options::init();
     size::init();
+    leaves::init();
     round::init();
     price::init();
 }

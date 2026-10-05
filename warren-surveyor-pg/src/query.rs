@@ -158,6 +158,78 @@ pub(crate) unsafe fn cells(list: *mut pg_sys::List) -> Vec<*mut c_void> {
         .collect()
 }
 
+/// A table whose own rows a relation read with its inheritance children or its partitions reads:
+/// its place in the planner's range table, the planner's relation for it, and for each column of
+/// the relation read, from 1, the table's own column, 0 where it has none.
+pub(crate) struct Member {
+    pub varno: pg_sys::Index,
+    pub rel: *mut pg_sys::RelOptInfo,
+    pub columns: Vec<pg_sys::AttrNumber>,
+}
+
+impl Member {
+    /// The member's own column for column `attnum` of the relation read: none where it has none.
+    pub(crate) fn column(&self, attnum: pg_sys::AttrNumber) -> Option<pg_sys::AttrNumber> {
+        self.columns
+            .get((attnum as usize).checked_sub(1)?)
+            .copied()
+            .filter(|&c| c > 0)
+    }
+}
+
+/// The tables whose own rows the relation at `varno` of `root`'s range table reads, where it is
+/// read with its inheritance children or its partitions: a member that is itself read with its
+/// partitions is read through to them, and a member the planner ruled out by its constraints, or
+/// pruned, is left out.
+pub(crate) unsafe fn members(root: *mut pg_sys::PlannerInfo, varno: pg_sys::Index) -> Vec<Member> {
+    let mut out = Vec::new();
+    if (*root).simple_rel_array.is_null() || (*root).simple_rte_array.is_null() {
+        return out;
+    }
+    for item in cells((*root).append_rel_list) {
+        let info = item as *mut pg_sys::AppendRelInfo;
+        if (*info).parent_relid != varno {
+            continue;
+        }
+        let child = (*info).child_relid;
+        if child as i32 >= (*root).simple_rel_array_size {
+            continue;
+        }
+        let columns: Vec<pg_sys::AttrNumber> = cells((*info).translated_vars)
+            .into_iter()
+            .map(|v| {
+                let v = bare(v as *mut pg_sys::Node);
+                if !v.is_null() && (*v).type_ == pg_sys::NodeTag::T_Var {
+                    (*(v as *mut pg_sys::Var)).varattno
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let rte = *(*root).simple_rte_array.add(child as usize);
+        if !rte.is_null() && (*rte).inh {
+            for m in members(root, child) {
+                let through = columns.iter().map(|&c| m.column(c).unwrap_or(0)).collect();
+                out.push(Member {
+                    columns: through,
+                    ..m
+                });
+            }
+            continue;
+        }
+        let rel = *(*root).simple_rel_array.add(child as usize);
+        if rel.is_null() || pg_sys::is_dummy_rel(rel) {
+            continue;
+        }
+        out.push(Member {
+            varno: child,
+            rel,
+            columns,
+        });
+    }
+    out
+}
+
 /// Releases what `examine_indexcol` found.
 pub(crate) unsafe fn release(vardata: &mut pg_sys::VariableStatData) {
     if !vardata.statsTuple.is_null() {

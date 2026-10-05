@@ -69,6 +69,9 @@ const BTORDER_PROC: u16 = 1;
 /// The downlinks between the ends at which the read stops above the level just over the leaves.
 pub(crate) const DOWNLINKS: u64 = 10;
 
+/// The leaves a read of the key's first or last value passes over when they hold no entry.
+const EMPTY_LEAVES: u32 = 8;
+
 /// The special space of a B-tree page.
 #[repr(C)]
 struct Opaque {
@@ -179,6 +182,26 @@ pub(crate) enum Leaf {
 /// What takes each entry between the ends on a leaf the read reads: where the leaf lies, the
 /// entry, and the rows it stands for.
 pub(crate) type Each<'a> = dyn FnMut(Leaf, pg_sys::IndexTuple, u64) + 'a;
+
+/// Whether a type's values lie one apart, so that the values between two of them are counted:
+/// the integer types and the date.
+pub(crate) fn countable(kind: pg_sys::Oid) -> bool {
+    kind == pg_sys::INT2OID
+        || kind == pg_sys::INT4OID
+        || kind == pg_sys::INT8OID
+        || kind == pg_sys::DATEOID
+}
+
+/// A whole number as a value of the countable type `kind`.
+pub(crate) fn datum_of(n: i64, kind: pg_sys::Oid) -> pg_sys::Datum {
+    if kind == pg_sys::INT2OID {
+        pg_sys::Datum::from(n as i16)
+    } else if kind == pg_sys::INT4OID || kind == pg_sys::DATEOID {
+        pg_sys::Datum::from(n as i32)
+    } else {
+        pg_sys::Datum::from(n)
+    }
+}
 
 /// Whether a type is stored as one count of microseconds: the timestamp, with or without a time
 /// zone.
@@ -1394,6 +1417,99 @@ pub(crate) unsafe fn steps(
     Some((Some(found), pages))
 }
 
+/// The first and last values other than NULL of the leading column of the B-tree `index`, where
+/// its type counts its values, read from the entries at the two ends of the key: the smaller and
+/// the larger, and the pages read. None where the read would read more than `most` pages.
+pub(crate) unsafe fn ends(index: pg_sys::Relation, most: u32) -> Option<(i64, i64, u32)> {
+    let order = Order::of(index);
+    let c = order.columns.first()?;
+    if !countable(c.input) {
+        return None;
+    }
+    room(0, most)?;
+    let (_metapage, meta) = metapage(index)?;
+    // the NULL block lies at one end of the key, and the values between the two positions
+    let (start, stop) = if c.nulls_first {
+        (
+            End {
+                parts: vec![None],
+                after: true,
+            },
+            End {
+                parts: Vec::new(),
+                after: true,
+            },
+        )
+    } else {
+        (
+            End {
+                parts: Vec::new(),
+                after: false,
+            },
+            End {
+                parts: vec![None],
+                after: false,
+            },
+        )
+    };
+    let (a, p1) = entry_next_to(index, &meta, &order, &start, true, most - 1)?;
+    let (b, p2) = entry_next_to(index, &meta, &order, &stop, false, most - 1 - p1)?;
+    Some((a.min(b), a.max(b), 1 + p1 + p2))
+}
+
+/// The leading value, as a whole number, of the first entry after the position `x` (`forward`), or
+/// of the last entry before it, passing over a few leaves that hold none. None where it is NULL or
+/// not found, or where the read would read more than `most` pages.
+unsafe fn entry_next_to(
+    index: pg_sys::Relation,
+    meta: &Meta,
+    order: &Order,
+    x: &End,
+    forward: bool,
+    most: u32,
+) -> Option<(i64, u32)> {
+    let (at, mut pages) = descend(index, meta, order, x, 0, most)?;
+    let mut page = at.page;
+    for _ in 0..EMPTY_LEAVES {
+        if page.opaque().flags & BTP_LEAF == 0 {
+            return None;
+        }
+        let (first, last) = (page.first_data(), page.last());
+        let mut offsets: Vec<pg_sys::OffsetNumber> = (first..=last).collect();
+        if !forward {
+            offsets.reverse();
+        }
+        let wanted = if forward {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+        // a leaf VACUUM has deleted holds none, and an entry marked dead is no row
+        for offset in offsets {
+            let Some(t) = page.item(offset) else {
+                continue;
+            };
+            if order.place(t, x) == wanted {
+                let kind = order.columns[0].input;
+                return value(t, 1, order.desc)
+                    .and_then(|v| whole(v, kind))
+                    .map(|v| (v, pages));
+            }
+        }
+        let sibling = if forward {
+            page.opaque().next
+        } else {
+            page.opaque().prev
+        };
+        if sibling == P_NONE {
+            return None;
+        }
+        room(pages, most)?;
+        page = read(index, sibling)?;
+        pages += 1;
+    }
+    None
+}
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
@@ -1875,6 +1991,35 @@ mod tests {
         assert!(places.is_none());
         assert!(pages <= 8, "{pages} pages");
         unsafe { pg_sys::index_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
+    }
+
+    #[pg_test]
+    fn the_first_and_last_values_of_a_countable_leading_column_are_read_at_the_two_ends() {
+        Spi::run(
+            "CREATE TABLE ended AS SELECT CASE WHEN g % 7 = 0 THEN NULL ELSE 16 + g END AS a, g AS v \
+             FROM generate_series(1, 40000) g; \
+             CREATE INDEX ended_a ON ended (a); \
+             CREATE INDEX ended_a_first ON ended (a NULLS FIRST); \
+             CREATE INDEX ended_a_desc ON ended (a DESC); \
+             CREATE INDEX ended_a_desc_last ON ended (a DESC NULLS LAST); \
+             ANALYZE ended",
+        )
+        .unwrap();
+        let truth = Spi::get_two::<i32, i32>("SELECT min(a), max(a) FROM ended").unwrap();
+        let truth = (truth.0.unwrap() as i64, truth.1.unwrap() as i64);
+        for index in [
+            "ended_a",
+            "ended_a_first",
+            "ended_a_desc",
+            "ended_a_desc_last",
+        ] {
+            let rel = open(index);
+            let (lo, hi, pages) =
+                unsafe { super::ends(rel, u32::MAX) }.expect("a countable column's ends");
+            assert_eq!((lo, hi), truth, "{index}");
+            assert!(pages <= 12, "{index}: {pages} pages");
+            unsafe { pg_sys::index_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
+        }
     }
 
     #[pg_test]

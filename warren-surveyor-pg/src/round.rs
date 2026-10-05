@@ -62,6 +62,7 @@ fn outermost() -> bool {
 
 /// Forgets everything kept for the round, or for a planning outside one.
 pub(crate) fn forget_all() {
+    crate::leaves::forget();
     crate::size::forget_from(0);
     crate::budget::forget();
 }
@@ -141,6 +142,7 @@ unsafe extern "C-unwind" fn plan(
 /// What the surveyor has measured and drawn for the statement being planned: what its B-trees'
 /// leaves, its WITH queries' reads and its relations' conditions measured, and its budget.
 struct Kept {
+    leaves: crate::leaves::Saved,
     size: crate::size::Saved,
     budget: crate::budget::Saved,
 }
@@ -148,12 +150,14 @@ struct Kept {
 impl Kept {
     fn now() -> Kept {
         Kept {
+            leaves: crate::leaves::saved(),
             size: crate::size::saved(),
             budget: crate::budget::saved(),
         }
     }
 
     fn restore(self) {
+        crate::leaves::put_back(self.leaves);
         crate::size::put_back(self.size);
         crate::budget::put_back(self.budget);
     }
