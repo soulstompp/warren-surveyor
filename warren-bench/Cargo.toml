@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "warren-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Kenneth Allen Flegal"]
+description = "Runs a declared set of questions against PostgreSQL targets and records each one's pages, time and plan, and whether its answer is right"
+repository = "https://github.com/soulstompp/warren-surveyor"
+readme = "README.md"
+keywords = ["postgresql", "benchmark", "database", "indexes", "explain"]
+categories = ["database", "command-line-utilities"]
+
+[[bin]]
+name = "warren-bench"
+path = "src/main.rs"
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+serde_json = "1"
+# Held at 58: from 60 on, float columns are written with a column order that some Parquet readers refuse to open.
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "58"
+arrow-schema = "58"

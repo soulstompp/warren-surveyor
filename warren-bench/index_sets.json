@@ -1,0 +1,10 @@
+{
+  "sets": {
+    "all": { "off": [] },
+    "dba": { "off": [ { "method": "surveyor" } ] },
+    "keys": { "off": [ { "constraint": false } ] }
+  },
+  "families": {
+    "without": { "base": "all", "off": [ { "constraint": false } ] }
+  }
+}

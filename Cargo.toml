@@ -1,5 +1,7 @@
 [workspace]
-members = ["warren-surveyor-pg", "warren-pg-speller"]
+members = ["warren-surveyor-pg", "warren-pg-speller", "warren-bench"]
+# A plain `cargo build` builds the bench alone; the surveyor builds with `cargo pgrx`.
+default-members = ["warren-bench"]
 resolver = "2"
 
 [profile.dev]

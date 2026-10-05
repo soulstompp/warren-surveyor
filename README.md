@@ -12,3 +12,4 @@ tables the statement reads, and where they stop, PostgreSQL's own estimate stand
 |---|---|
 | `warren-surveyor-pg` | PostgreSQL 18: the extension `warren_surveyor_pg` and its index access method, `surveyor` |
 | `warren-pg-speller` | PostgreSQL 18: a planner hook that plans a `SELECT` through another spelling of it that returns the same rows; `warren_surveyor_pg` installs it |
+| `warren-bench` | runs a set of questions on a database under sets of its indexes, and records each one's pages, time and plan, and whether its answer is right; the kit's runner, with the kit inside it: `cargo install --locked warren-bench` |
