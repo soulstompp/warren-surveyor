@@ -16,6 +16,7 @@ mod conditions;
 mod gin;
 #[allow(dead_code)]
 mod gist;
+mod grouping;
 mod leaves;
 #[allow(dead_code)]
 mod measure;
@@ -41,6 +42,7 @@ pub extern "C-unwind" fn _PG_init() {
     size::init();
     leaves::init();
     round::init();
+    grouping::init();
     price::init();
 }
 
@@ -425,6 +427,535 @@ mod tests {
              CREATE INDEX desc_probe_a ON desc_probe USING surveyor (a DESC)",
         )
         .unwrap();
+    }
+
+    /// A catalogue each of whose facts lies in the table its key decides: 7 root themes and 40
+    /// themes under them; 400 sets, each in a theme under a root; 600 builders, each in a zone; each
+    /// builder's 10 holdings, each of a set; 20,000 purchases, each of a holding. Every row is written
+    /// by joining what it relates to. Each table carries its primary key, a B-tree on what joins into
+    /// it (the themes on their parent, the sets on their theme, the holdings on their set, the
+    /// purchases on their holding) and one surveyor. The `*_plain` copies hold the same rows, primary
+    /// keys and B-trees with no surveyor.
+    fn sets_and_buys() {
+        Spi::run(
+            "CREATE TABLE themes (id int PRIMARY KEY, parent_id int); \
+             INSERT INTO themes SELECT g, NULL FROM generate_series(1, 7) g; \
+             INSERT INTO themes SELECT 100 + k, r.id FROM generate_series(0, 39) k \
+                 JOIN themes r ON r.id = 1 + k % 7; \
+             CREATE TABLE sets (set_num text PRIMARY KEY, theme_id int NOT NULL); \
+             INSERT INTO sets SELECT 's' || g, t.id FROM generate_series(1, 400) g \
+                 JOIN themes t ON t.id = 100 + g % 40; \
+             CREATE TABLE builders (builder_id int PRIMARY KEY, zone int NOT NULL); \
+             INSERT INTO builders SELECT g, g % 9 FROM generate_series(1, 600) g; \
+             CREATE TABLE holdings (builder_id int NOT NULL, row_no int NOT NULL, set_num text NOT NULL, \
+                                    PRIMARY KEY (builder_id, row_no)); \
+             INSERT INTO holdings SELECT b.builder_id, r, s.set_num \
+             FROM builders b CROSS JOIN generate_series(1, 10) r \
+                 JOIN sets s ON s.set_num = 's' || (1 + (b.builder_id * 17 + r * 31) % 400); \
+             CREATE TABLE buys (id int PRIMARY KEY, builder_id int NOT NULL, row_no int NOT NULL, \
+                                qty int NOT NULL); \
+             INSERT INTO buys SELECT g, h.builder_id, h.row_no, g % 7 FROM generate_series(1, 20000) g \
+                 JOIN holdings h ON h.builder_id = 1 + (g * 7919) % 6000 % 600 \
+                                AND h.row_no = 1 + (g * 7919) % 6000 / 600; \
+             CREATE TABLE themes_plain AS SELECT * FROM themes; \
+             CREATE TABLE sets_plain AS SELECT * FROM sets; \
+             CREATE TABLE builders_plain AS SELECT * FROM builders; \
+             CREATE TABLE holdings_plain AS SELECT * FROM holdings; \
+             CREATE TABLE buys_plain AS SELECT * FROM buys; \
+             ALTER TABLE themes_plain ADD PRIMARY KEY (id); \
+             ALTER TABLE sets_plain ADD PRIMARY KEY (set_num); \
+             ALTER TABLE builders_plain ADD PRIMARY KEY (builder_id); \
+             ALTER TABLE holdings_plain ADD PRIMARY KEY (builder_id, row_no); \
+             ALTER TABLE buys_plain ADD PRIMARY KEY (id); \
+             CREATE INDEX ON themes (parent_id); CREATE INDEX ON themes_plain (parent_id); \
+             CREATE INDEX ON sets (theme_id); CREATE INDEX ON sets_plain (theme_id); \
+             CREATE INDEX ON holdings (set_num); CREATE INDEX ON holdings_plain (set_num); \
+             CREATE INDEX ON buys (builder_id, row_no); CREATE INDEX ON buys_plain (builder_id, row_no); \
+             CREATE INDEX themes_key ON themes USING surveyor (id); \
+             CREATE INDEX sets_key ON sets USING surveyor (set_num); \
+             CREATE INDEX builders_key ON builders USING surveyor (builder_id); \
+             CREATE INDEX holdings_key ON holdings USING surveyor (builder_id, row_no); \
+             CREATE INDEX buys_key ON buys USING surveyor (id); \
+             ANALYZE themes; ANALYZE sets; ANALYZE builders; ANALYZE holdings; ANALYZE buys; \
+             ANALYZE themes_plain; ANALYZE sets_plain; ANALYZE builders_plain; ANALYZE holdings_plain; \
+             ANALYZE buys_plain",
+        )
+        .expect("the sets and buys could not be made");
+    }
+
+    /// `query` read from the plain copies of the tables `sets_and_buys` makes.
+    fn on_plain(query: &str) -> String {
+        let mut plain = query.to_string();
+        for table in ["themes", "sets", "builders", "holdings", "buys"] {
+            plain = plain.replace(&format!(" {table} "), &format!(" {table}_plain "));
+        }
+        plain
+    }
+
+    /// The purchases of the sets under one root, each against every holding of its set: `t` the
+    /// themes under the root, `bb` the buyer, `ob` the holder.
+    const EACH_PAIR: &str = "FROM themes t JOIN sets s ON s.theme_id = t.id \
+        JOIN holdings h ON h.set_num = s.set_num \
+        JOIN buys b ON b.builder_id = h.builder_id AND b.row_no = h.row_no \
+        JOIN builders bb ON bb.builder_id = h.builder_id \
+        JOIN holdings o ON o.set_num = s.set_num \
+        JOIN builders ob ON ob.builder_id = o.builder_id";
+
+    /// The answer of `query` on the tables with surveyors and, as written, on their plain copies.
+    fn respelled_and_as_written(query: &str) -> (Vec<String>, Vec<String>, String, String) {
+        let plain = on_plain(query);
+        (
+            texts(query),
+            texts(&plain),
+            texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {query}")).join("\n"),
+            texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {plain}")).join("\n"),
+        )
+    }
+
+    /// The columns of the first Group Key line of `plan`.
+    fn group_key(plan: &str) -> String {
+        plan.lines()
+            .find(|l| l.contains("Group Key"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    #[pg_test]
+    fn a_group_by_a_tables_unique_key_is_planned_on_the_key_alone() {
+        Spi::run(
+            "CREATE TABLE kits (set_num text PRIMARY KEY, theme int NOT NULL, qty int); \
+             INSERT INTO kits SELECT 's' || g, g % 40, g % 7 FROM generate_series(1, 4000) g; \
+             CREATE TABLE kits_plain AS SELECT * FROM kits; \
+             ALTER TABLE kits_plain ADD PRIMARY KEY (set_num); \
+             CREATE INDEX kits_theme ON kits USING surveyor (theme, set_num); \
+             ANALYZE kits; ANALYZE kits_plain",
+        )
+        .unwrap();
+        let keys = |query: &str| {
+            group_key(&texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {query}")).join("\n"))
+        };
+        // the table with a surveyor groups as the one without
+        let query = "SELECT set_num || ' ' || sum(qty) FROM kits GROUP BY set_num";
+        let mut answer = texts(query);
+        let mut written = texts(&query.replace("kits", "kits_plain"));
+        answer.sort();
+        written.sort();
+        assert_eq!(answer, written);
+        assert_eq!(keys(query), "Group Key: kits.set_num");
+        assert_eq!(
+            keys(&query.replace("kits", "kits_plain")),
+            "Group Key: kits_plain.set_num"
+        );
+        // naming the surveyor's leading column ahead of the key does not keep it: the planner
+        // groups by the key alone
+        let named = "SELECT set_num || ' ' || sum(qty) FROM kits GROUP BY theme, set_num";
+        assert_eq!(keys(named), "Group Key: kits.set_num");
+    }
+
+    /// Whether a plan groups rows it sorts first: a Sort or an Incremental Sort right beneath a
+    /// GroupAggregate or a Group.
+    fn sorts_to_group(plan: &str) -> bool {
+        let nodes: Vec<&str> = plan
+            .lines()
+            .filter(|l| l.contains("->") || !l.starts_with(' '))
+            .map(|l| l.trim_start().trim_start_matches("->").trim_start())
+            .collect();
+        nodes.windows(2).any(|w| {
+            (w[0].starts_with("GroupAggregate") || w[0].starts_with("Group "))
+                && (w[1].starts_with("Sort") || w[1].starts_with("Incremental Sort"))
+        })
+    }
+
+    /// Each root's purchases against every holding of their sets, read one root at a time and
+    /// grouped by buyer and holder: a line per root of its pairs, and of their purchases weighed by
+    /// the two zones.
+    fn each_root() -> String {
+        format!(
+            "SELECT r.id || ' ' || x.pairs || ' ' || x.weight AS line \
+             FROM themes r CROSS JOIN LATERAL ( \
+                 SELECT count(*) AS pairs, sum(y.n * (y.zone + 1) * (y.owned_zone + 1)) AS weight \
+                 FROM (SELECT bb.zone, ob.zone AS owned_zone, count(*) AS n {EACH_PAIR} \
+                       WHERE t.parent_id = r.id GROUP BY bb.builder_id, ob.builder_id) y) x \
+             WHERE r.parent_id IS NULL ORDER BY 1"
+        )
+    }
+
+    /// The count each of `lines` carries in its second field.
+    fn counts_of(lines: &[String]) -> Vec<i64> {
+        lines
+            .iter()
+            .map(|l| l.split(' ').nth(1).unwrap_or_default().parse().unwrap_or(0))
+            .collect()
+    }
+
+    #[pg_test]
+    fn a_grouping_read_one_leading_value_at_a_time_hashes_where_the_planner_sorts() {
+        sets_and_buys();
+        Spi::run("SET LOCAL work_mem = '64kB'").unwrap();
+        let (hashed, written, plan, plain_plan) = respelled_and_as_written(&each_root());
+        assert_eq!(hashed, written);
+        // every root pairs more builders than the 81 pairs of zones
+        let pairs = counts_of(&hashed);
+        assert_eq!(pairs.len(), 7, "{hashed:?}");
+        assert!(pairs.iter().all(|&p| p > 81), "{hashed:?}");
+        assert!(
+            plan.contains("Group Key: bb.builder_id, ob.builder_id"),
+            "{plan}"
+        );
+        assert!(plan.contains("HashAggregate"), "{plan}");
+        assert!(!sorts_to_group(&plan), "{plan}");
+        assert!(sorts_to_group(&plain_plan), "{plain_plan}");
+    }
+
+    #[pg_test]
+    fn a_grouping_read_at_one_parameter_value_hashes_where_the_planner_sorts() {
+        sets_and_buys();
+        Spi::run("SET LOCAL work_mem = '64kB'; SET LOCAL plan_cache_mode = force_generic_plan")
+            .unwrap();
+        let query = format!(
+            "SELECT bb.builder_id || ' ' || ob.builder_id || ' ' || count(*) AS line {EACH_PAIR} \
+             WHERE t.parent_id = $1 GROUP BY bb.builder_id, ob.builder_id ORDER BY 1"
+        );
+        let plain = on_plain(&query);
+        Spi::run(&format!(
+            "PREPARE at_root(int) AS {query}; PREPARE plain_at_root(int) AS {plain}"
+        ))
+        .unwrap();
+        let plan = texts("EXPLAIN (COSTS OFF, VERBOSE) EXECUTE at_root(3)").join("\n");
+        let plain_plan = texts("EXPLAIN (COSTS OFF, VERBOSE) EXECUTE plain_at_root(3)").join("\n");
+        let hashed = texts("EXECUTE at_root(3)");
+        assert_eq!(hashed, texts("EXECUTE plain_at_root(3)"));
+        assert!(hashed.len() > 81, "{} pairs", hashed.len());
+        assert!(plan.contains("$1"), "{plan}");
+        assert!(plan.contains("HashAggregate"), "{plan}");
+        assert!(!sorts_to_group(&plan), "{plan}");
+        assert!(sorts_to_group(&plain_plan), "{plain_plan}");
+        Spi::run("DEALLOCATE at_root; DEALLOCATE plain_at_root").unwrap();
+    }
+
+    #[pg_test]
+    fn a_grouping_that_reads_a_surveyor_table_at_every_leading_value_is_planned_as_chosen() {
+        sets_and_buys();
+        Spi::run("SET LOCAL work_mem = '64kB'").unwrap();
+        // each root's purchases, against every builder in their buyer's zone whatever its root,
+        // grouped finely enough that the planner sorts to group them; no B-tree of the builders
+        // leads with the zone
+        let (grouped, written, plan, plain_plan) = respelled_and_as_written(
+            "SELECT r.id || ' ' || x.groups || ' ' || x.weight AS line \
+             FROM themes r CROSS JOIN LATERAL ( \
+                 SELECT count(*) AS groups, sum(y.n * (y.qty + 1) * (y.zone + 1) * y.row_no) AS weight \
+                 FROM (SELECT b.qty, b.row_no, z.builder_id, z.zone, count(*) AS n \
+                       FROM themes t JOIN sets s ON s.theme_id = t.id \
+                           JOIN holdings h ON h.set_num = s.set_num \
+                           JOIN buys b ON b.builder_id = h.builder_id AND b.row_no = h.row_no \
+                           JOIN builders bb ON bb.builder_id = h.builder_id \
+                           JOIN builders z ON z.zone = bb.zone \
+                       WHERE t.parent_id = r.id \
+                       GROUP BY b.qty, b.row_no, z.builder_id, z.zone) y) x \
+             WHERE r.parent_id IS NULL ORDER BY 1",
+        );
+        assert_eq!(grouped, written);
+        let groups = counts_of(&grouped);
+        assert_eq!(groups.len(), 7, "{grouped:?}");
+        assert!(groups.iter().all(|&g| g > 0), "{grouped:?}");
+        assert!(sorts_to_group(&plain_plan), "{plain_plan}");
+        assert!(sorts_to_group(&plan), "{plan}");
+    }
+
+    #[pg_test]
+    fn a_grouping_over_every_value_of_a_loop_is_planned_as_chosen() {
+        sets_and_buys();
+        Spi::run("SET LOCAL work_mem = '64kB'").unwrap();
+        // the loop's own grouping reads one root at a time; the grouping over it reads every root
+        let (grouped, written, plan, _) = respelled_and_as_written(&format!(
+            "SELECT count(*) || ' ' || sum(z.n * z.root * (z.zone + 1) * (z.owned_zone + 1)) AS line \
+             FROM (SELECT r.id AS root, x.buyer, x.holder, x.zone, x.owned_zone, sum(x.n) AS n \
+                   FROM themes r CROSS JOIN LATERAL ( \
+                       SELECT bb.builder_id AS buyer, ob.builder_id AS holder, bb.zone, \
+                              ob.zone AS owned_zone, count(*) AS n {EACH_PAIR} \
+                       WHERE t.parent_id = r.id GROUP BY bb.builder_id, ob.builder_id) x \
+                   WHERE r.parent_id IS NULL \
+                   GROUP BY r.id, x.buyer, x.holder, x.zone, x.owned_zone) z"
+        ));
+        assert_eq!(grouped, written);
+        let pairs: i64 = grouped[0].split(' ').next().unwrap().parse().unwrap();
+        assert!(pairs > 7 * 81, "{grouped:?}");
+        let hashed_in_loop = plan.lines().collect::<Vec<_>>().windows(3).any(|w| {
+            w[0].contains("HashAggregate")
+                && w[2].contains("Group Key: bb.builder_id, ob.builder_id")
+        });
+        assert!(hashed_in_loop, "{plan}");
+        assert!(sorts_to_group(&plan), "{plan}");
+    }
+
+    #[pg_test]
+    fn with_hashing_turned_off_a_grouping_at_one_leading_value_is_planned_as_chosen() {
+        sets_and_buys();
+        Spi::run("SET LOCAL work_mem = '64kB'; SET LOCAL enable_hashagg = off").unwrap();
+        let (grouped, written, plan, _) = respelled_and_as_written(&each_root());
+        assert_eq!(grouped, written);
+        assert!(sorts_to_group(&plan), "{plan}");
+    }
+
+    #[pg_test]
+    fn a_grouping_at_one_parameter_value_is_not_sorted_beneath_a_gather() {
+        sets_and_buys();
+        Spi::run(
+            "SET LOCAL work_mem = '64kB'; SET LOCAL plan_cache_mode = force_generic_plan; \
+             SET LOCAL max_parallel_workers_per_gather = 4; SET LOCAL parallel_setup_cost = 0; \
+             SET LOCAL parallel_tuple_cost = 0; SET LOCAL min_parallel_table_scan_size = 0; \
+             SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off; \
+             SET LOCAL enable_bitmapscan = off",
+        )
+        .unwrap();
+        // grouped by a key with a group per row, in the order the answer is sorted by
+        let query = "SELECT b.id || ' ' || count(*) AS line \
+             FROM themes t JOIN sets s ON s.theme_id = t.id \
+                 JOIN holdings h ON h.set_num = s.set_num \
+                 JOIN buys b ON b.builder_id = h.builder_id AND b.row_no = h.row_no \
+             WHERE t.parent_id = $1 GROUP BY b.id ORDER BY b.id";
+        Spi::run(&format!(
+            "PREPARE parallel_at_root(int) AS {query}; \
+             PREPARE plain_parallel_at_root(int) AS {}",
+            on_plain(query)
+        ))
+        .unwrap();
+        let plan = texts("EXPLAIN (COSTS OFF) EXECUTE parallel_at_root(3)").join("\n");
+        let plain_plan = texts("EXPLAIN (COSTS OFF) EXECUTE plain_parallel_at_root(3)").join("\n");
+        assert_eq!(
+            texts("EXECUTE parallel_at_root(3)"),
+            texts("EXECUTE plain_parallel_at_root(3)")
+        );
+        assert!(
+            plain_plan.contains("GroupAggregate") && plain_plan.contains("Gather Merge"),
+            "{plain_plan}"
+        );
+        assert!(!plan.contains("GroupAggregate"), "{plan}");
+        Spi::run("DEALLOCATE parallel_at_root; DEALLOCATE plain_parallel_at_root").unwrap();
+    }
+
+    /// A catalogue each of whose facts lies in the table its key decides: 4 themes; 1,200 sets,
+    /// each in a theme; 3,000 builders, each in a zone; each builder's 4 holdings, each of a set;
+    /// 200,000 purchases, each of a holding. Every row is written by joining what it relates to.
+    /// Each table carries its primary key and a B-tree on each column that joins into it: the sets on
+    /// their theme, the holdings on their set, the purchases on their holding. `crew` holds the
+    /// builders again with no unique key, and a B-tree led by the zone. Each carries one surveyor, on
+    /// its primary key or, without one, on the columns its B-tree names. The `*_plain` copies hold
+    /// the same rows, primary keys and B-trees, with no surveyor; the themes, read by both, carry none.
+    fn catalogue() {
+        Spi::run(
+            "CREATE TABLE themes (id int PRIMARY KEY); \
+             INSERT INTO themes SELECT g FROM generate_series(1, 4) g; \
+             CREATE TABLE kit_sets (set_num text PRIMARY KEY, theme_id int NOT NULL); \
+             INSERT INTO kit_sets SELECT 's' || g, t.id FROM generate_series(1, 1200) g \
+                 JOIN themes t ON t.id = 1 + g % 4; \
+             CREATE TABLE kit_builders (id int PRIMARY KEY, zone int NOT NULL); \
+             INSERT INTO kit_builders SELECT g, g % 9 FROM generate_series(1, 3000) g; \
+             CREATE TABLE kit_holdings (builder_id int NOT NULL, row_no int NOT NULL, \
+                                        set_num text NOT NULL, PRIMARY KEY (builder_id, row_no)); \
+             INSERT INTO kit_holdings SELECT b.id, r, s.set_num \
+             FROM kit_builders b CROSS JOIN generate_series(1, 4) r \
+                 JOIN kit_sets s ON s.set_num = 's' || (1 + (b.id * 17 + r * 31) % 1200); \
+             CREATE TABLE kit_buys (builder_id int NOT NULL, row_no int NOT NULL, qty int NOT NULL); \
+             INSERT INTO kit_buys SELECT h.builder_id, h.row_no, g % 7 FROM generate_series(1, 200000) g \
+                 JOIN kit_holdings h ON h.builder_id = 1 + (g * 7919) % 12000 % 3000 \
+                                    AND h.row_no = 1 + (g * 7919) % 12000 / 3000; \
+             CREATE TABLE crew (id int NOT NULL, zone int NOT NULL); \
+             INSERT INTO crew SELECT id, zone FROM kit_builders; \
+             CREATE TABLE kit_sets_plain AS SELECT * FROM kit_sets; \
+             CREATE TABLE kit_holdings_plain AS SELECT * FROM kit_holdings; \
+             CREATE TABLE kit_buys_plain AS SELECT * FROM kit_buys; \
+             CREATE TABLE kit_builders_plain AS SELECT * FROM kit_builders; \
+             CREATE TABLE crew_plain AS SELECT * FROM crew; \
+             ALTER TABLE kit_sets_plain ADD PRIMARY KEY (set_num); \
+             ALTER TABLE kit_holdings_plain ADD PRIMARY KEY (builder_id, row_no); \
+             ALTER TABLE kit_builders_plain ADD PRIMARY KEY (id); \
+             CREATE INDEX ON kit_sets (theme_id); CREATE INDEX ON kit_sets_plain (theme_id); \
+             CREATE INDEX ON kit_holdings (set_num); CREATE INDEX ON kit_holdings_plain (set_num); \
+             CREATE INDEX ON kit_buys (builder_id, row_no); CREATE INDEX ON kit_buys_plain (builder_id, row_no); \
+             CREATE INDEX ON crew (zone, id); CREATE INDEX ON crew_plain (zone, id); \
+             CREATE INDEX kit_sets_key ON kit_sets USING surveyor (set_num); \
+             CREATE INDEX kit_holdings_key ON kit_holdings USING surveyor (builder_id, row_no); \
+             CREATE INDEX kit_buys_key ON kit_buys USING surveyor (builder_id, row_no); \
+             CREATE INDEX kit_builders_key ON kit_builders USING surveyor (id); \
+             CREATE INDEX crew_key ON crew USING surveyor (zone, id); \
+             ANALYZE themes; ANALYZE kit_sets; ANALYZE kit_holdings; ANALYZE kit_buys; \
+             ANALYZE kit_builders; ANALYZE crew; ANALYZE kit_sets_plain; ANALYZE kit_holdings_plain; \
+             ANALYZE kit_buys_plain; ANALYZE kit_builders_plain; ANALYZE crew_plain",
+        )
+        .expect("the catalogue could not be made");
+    }
+
+    /// `query` read from the plain copies of the tables `catalogue` makes.
+    fn on_plain_catalogue(query: &str) -> String {
+        let mut plain = query.to_string();
+        for table in [
+            "kit_sets",
+            "kit_holdings",
+            "kit_buys",
+            "kit_builders",
+            "crew",
+        ] {
+            plain = plain.replace(&format!(" {table} "), &format!(" {table}_plain "));
+        }
+        plain
+    }
+
+    /// The answer and plan of `query`, and of the same over the plain copies.
+    fn catalogue_and_plain(query: &str) -> (Vec<String>, Vec<String>, String, String) {
+        let plain = on_plain_catalogue(query);
+        (
+            texts(query),
+            texts(&plain),
+            texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {query}")).join("\n"),
+            texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {plain}")).join("\n"),
+        )
+    }
+
+    /// Each theme's purchases, grouped by builder, quantity and set, the builders joined by `joined`.
+    fn each_theme(joined: &str) -> String {
+        format!(
+            "SELECT count(*)::text || ' ' || sum(x.n * x.builder * (x.qty + 1))::text AS line \
+             FROM themes t CROSS JOIN LATERAL ( \
+                 SELECT b.id AS builder, p.qty, count(*) AS n \
+                 FROM kit_sets s JOIN kit_holdings c ON c.set_num = s.set_num \
+                     JOIN kit_buys p ON p.builder_id = c.builder_id AND p.row_no = c.row_no {joined} \
+                 WHERE s.theme_id = t.id GROUP BY b.id, p.qty, c.set_num) x"
+        )
+    }
+
+    #[pg_test]
+    fn a_grouping_whose_joins_carry_one_value_through_each_table_hashes_where_the_planner_sorts() {
+        catalogue();
+        Spi::run("SET LOCAL work_mem = '64kB'").unwrap();
+        // the sets are entered at the theme, the holdings at the block's sets, the purchases at the
+        // block's holdings, and the builders by their own key from the block's holdings
+        let (hashed, written, plan, plain_plan) =
+            catalogue_and_plain(&each_theme("JOIN kit_builders b ON b.id = c.builder_id"));
+        assert_eq!(hashed, written);
+        assert!(!hashed[0].starts_with("0 "), "{hashed:?}");
+        assert!(plan.contains("HashAggregate"), "{plan}");
+        assert!(!sorts_to_group(&plan), "{plan}");
+        assert!(sorts_to_group(&plain_plan), "{plain_plan}");
+    }
+
+    #[pg_test]
+    fn a_grouping_at_one_parameter_whose_joins_carry_it_through_each_table_hashes() {
+        catalogue();
+        Spi::run("SET LOCAL work_mem = '64kB'; SET LOCAL plan_cache_mode = force_generic_plan")
+            .unwrap();
+        let query = "SELECT b.id || ' ' || p.qty || ' ' || c.set_num || ' ' || count(*) AS line \
+             FROM kit_sets s JOIN kit_holdings c ON c.set_num = s.set_num \
+                 JOIN kit_buys p ON p.builder_id = c.builder_id AND p.row_no = c.row_no \
+                 JOIN kit_builders b ON b.id = c.builder_id \
+             WHERE s.theme_id = $1 GROUP BY b.id, p.qty, c.set_num ORDER BY 1";
+        let plain = on_plain_catalogue(query);
+        Spi::run(&format!(
+            "PREPARE at_theme(int) AS {query}; PREPARE plain_at_theme(int) AS {plain}"
+        ))
+        .unwrap();
+        let plan = texts("EXPLAIN (COSTS OFF, VERBOSE) EXECUTE at_theme(3)").join("\n");
+        let plain_plan = texts("EXPLAIN (COSTS OFF, VERBOSE) EXECUTE plain_at_theme(3)").join("\n");
+        let hashed = texts("EXECUTE at_theme(3)");
+        assert_eq!(hashed, texts("EXECUTE plain_at_theme(3)"));
+        assert!(hashed.len() > 100, "{}", hashed.len());
+        assert!(plan.contains("HashAggregate"), "{plan}");
+        assert!(!sorts_to_group(&plan), "{plan}");
+        assert!(sorts_to_group(&plain_plan), "{plain_plan}");
+        Spi::run("DEALLOCATE at_theme; DEALLOCATE plain_at_theme").unwrap();
+    }
+
+    #[pg_test]
+    fn a_grouping_whose_joins_carry_one_value_through_a_class_hierarchy_hashes_where_every_class_is_surveyed(
+    ) {
+        catalogue();
+        // the purchases kept again as classes of one parent, by their quantity: the parent holding
+        // none of them, and each table with the B-tree on the holding and a surveyor
+        Spi::run(
+            "CREATE TABLE kit_buys_kinds (builder_id int NOT NULL, row_no int NOT NULL, qty int NOT NULL); \
+             CREATE TABLE kit_buys_few (CHECK (qty < 3)) INHERITS (kit_buys_kinds); \
+             CREATE TABLE kit_buys_many (CHECK (qty >= 3)) INHERITS (kit_buys_kinds); \
+             INSERT INTO kit_buys_few SELECT * FROM kit_buys WHERE qty < 3; \
+             INSERT INTO kit_buys_many SELECT * FROM kit_buys WHERE qty >= 3; \
+             CREATE INDEX ON kit_buys_kinds (builder_id, row_no); \
+             CREATE INDEX ON kit_buys_few (builder_id, row_no); \
+             CREATE INDEX ON kit_buys_many (builder_id, row_no); \
+             CREATE INDEX kit_buys_kinds_key ON kit_buys_kinds USING surveyor (builder_id, row_no); \
+             CREATE INDEX kit_buys_few_key ON kit_buys_few USING surveyor (builder_id, row_no); \
+             CREATE INDEX kit_buys_many_key ON kit_buys_many USING surveyor (builder_id, row_no); \
+             ANALYZE kit_buys_kinds; ANALYZE kit_buys_few; ANALYZE kit_buys_many; \
+             SET LOCAL work_mem = '64kB'",
+        )
+        .unwrap();
+        let flat = each_theme("JOIN kit_builders b ON b.id = c.builder_id");
+        let query = flat.replace(" kit_buys ", " kit_buys_kinds ");
+        let plan = |query: &str| texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {query}")).join("\n");
+        let plain = on_plain_catalogue(&flat);
+        assert_eq!(texts(&query), texts(&plain));
+        let (hashed, plain_plan) = (plan(&query), plan(&plain));
+        assert!(hashed.contains("HashAggregate"), "{hashed}");
+        assert!(!sorts_to_group(&hashed), "{hashed}");
+        assert!(sorts_to_group(&plain_plan), "{plain_plan}");
+        // a class carrying no surveyor leaves the hierarchy outside the block: planned as chosen
+        Spi::run("DROP INDEX kit_buys_many_key").unwrap();
+        let chosen = plan(&query);
+        assert!(sorts_to_group(&chosen), "{chosen}");
+    }
+
+    #[pg_test]
+    fn a_grouping_through_a_class_hierarchy_hashes_past_an_empty_parent_that_carries_no_surveyor() {
+        catalogue();
+        // the purchases kept again as classes of one parent, by their quantity: the parent holding
+        // none of them and carrying no surveyor, each table the B-tree on the holding, and each class
+        // a surveyor
+        Spi::run(
+            "CREATE TABLE kit_buys_bare (builder_id int NOT NULL, row_no int NOT NULL, qty int NOT NULL); \
+             CREATE TABLE kit_buys_low (CHECK (qty < 3)) INHERITS (kit_buys_bare); \
+             CREATE TABLE kit_buys_high (CHECK (qty >= 3)) INHERITS (kit_buys_bare); \
+             INSERT INTO kit_buys_low SELECT * FROM kit_buys WHERE qty < 3; \
+             INSERT INTO kit_buys_high SELECT * FROM kit_buys WHERE qty >= 3; \
+             CREATE INDEX ON kit_buys_bare (builder_id, row_no); \
+             CREATE INDEX ON kit_buys_low (builder_id, row_no); \
+             CREATE INDEX ON kit_buys_high (builder_id, row_no); \
+             CREATE INDEX kit_buys_low_key ON kit_buys_low USING surveyor (builder_id, row_no); \
+             CREATE INDEX kit_buys_high_key ON kit_buys_high USING surveyor (builder_id, row_no); \
+             ANALYZE kit_buys_bare; ANALYZE kit_buys_low; ANALYZE kit_buys_high; \
+             SET LOCAL work_mem = '64kB'",
+        )
+        .unwrap();
+        let flat = each_theme("JOIN kit_builders b ON b.id = c.builder_id");
+        let query = flat.replace(" kit_buys ", " kit_buys_bare ");
+        let plan = |query: &str| texts(&format!("EXPLAIN (COSTS OFF, VERBOSE) {query}")).join("\n");
+        assert_eq!(texts(&query), texts(&on_plain_catalogue(&flat)));
+        let hashed = plan(&query);
+        assert!(hashed.contains("HashAggregate"), "{hashed}");
+        assert!(!sorts_to_group(&hashed), "{hashed}");
+        // once the parent holds rows of its own, it carries no surveyor for them: planned as chosen
+        Spi::run(
+            "INSERT INTO kit_buys_bare SELECT * FROM kit_buys WHERE qty = 0 LIMIT 500; \
+             ANALYZE kit_buys_bare",
+        )
+        .unwrap();
+        let chosen = plan(&query);
+        assert!(sorts_to_group(&chosen), "{chosen}");
+    }
+
+    #[pg_test]
+    fn a_grouping_that_joins_a_table_on_a_column_it_is_not_entered_by_is_planned_as_chosen() {
+        catalogue();
+        Spi::run("SET LOCAL work_mem = '64kB'").unwrap();
+        // the crew's B-tree leads with its zone and it has no unique key, so the builder joins no
+        // block of it
+        let (grouped, written, plan, plain_plan) =
+            catalogue_and_plain(&each_theme("JOIN crew b ON b.id = c.builder_id"));
+        assert_eq!(grouped, written);
+        assert_eq!(
+            sorts_to_group(&plan),
+            sorts_to_group(&plain_plan),
+            "{plan}\n{plain_plan}"
+        );
+        assert!(sorts_to_group(&plan), "{plan}");
     }
 
     // the size of a WITH RECURSIVE query, read while planning

@@ -263,6 +263,18 @@ pub(crate) unsafe fn planning(root: *mut pg_sys::PlannerInfo) -> Planning {
     Planning(Some(PLANNING.replace(glob)))
 }
 
+/// Forgets the budget of the planning outside a round whose top level `root` is, once that level's
+/// last stage is planned.
+pub(crate) unsafe fn planned(root: *mut pg_sys::PlannerInfo) {
+    if root.is_null() || !(*root).parent_root.is_null() || crate::round::in_round() {
+        return;
+    }
+    let glob = (*root).glob as usize;
+    if BUDGET.with(|b| b.borrow().as_ref().is_some_and(|b| b.planning == glob)) {
+        crate::round::forget_all();
+    }
+}
+
 /// Whether one of the surveyor's hooks runs for a planning outside a round.
 pub(crate) fn planning_outside_round() -> bool {
     PLANNING.get() != 0

@@ -139,6 +139,30 @@ pub(crate) unsafe fn bare(mut node: *mut pg_sys::Node) -> *mut pg_sys::Node {
     node
 }
 
+/// The leading key column of each valid B-tree over the whole of `relid` that leads with a column.
+pub(crate) unsafe fn btree_leading_columns(relid: pg_sys::Oid) -> Vec<i16> {
+    // the statement already holds its lock on every table it reads
+    let rel = pg_sys::relation_open(relid, pg_sys::NoLock as pg_sys::LOCKMODE);
+    let mut columns = Vec::new();
+    for index in oids(pg_sys::RelationGetIndexList(rel)) {
+        let idx = pg_sys::index_open(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let form = (*idx).rd_index;
+        if (*(*idx).rd_rel).relam == pg_sys::BTREE_AM_OID
+            && (*form).indisvalid
+            && (*form).indnkeyatts > 0
+            && pg_sys::RelationGetIndexPredicate(idx).is_null()
+        {
+            let column = *(*form).indkey.values.as_ptr();
+            if column > 0 && !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        pg_sys::index_close(idx, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+    }
+    pg_sys::relation_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+    columns
+}
+
 pub(crate) unsafe fn oids(list: *mut pg_sys::List) -> Vec<pg_sys::Oid> {
     if list.is_null() {
         return Vec::new();
