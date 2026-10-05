@@ -10,12 +10,18 @@ use pgrx::prelude::*;
 mod budget;
 #[allow(dead_code)]
 mod conditions;
+#[allow(dead_code)]
+mod gin;
 mod leaves;
 #[allow(dead_code)]
 mod measure;
 mod options;
+#[cfg(any(test, feature = "pg_test"))]
+mod planned;
 mod price;
 mod query;
+#[allow(dead_code)]
+mod reading;
 mod round;
 mod size;
 mod writes;

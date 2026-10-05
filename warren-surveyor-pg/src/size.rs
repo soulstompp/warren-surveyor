@@ -29,6 +29,7 @@
 //! whose predicate the planner proved from the question's own conditions.
 
 use crate::conditions::{self, Held};
+use crate::gin;
 use crate::query::{cells, surveyed, surveyor_am};
 use crate::round;
 use pgrx::pg_sys;
@@ -208,6 +209,7 @@ unsafe fn holds(
                 (h.clauses, stepped)
             })
         }
+        pg_sys::GIN_AM_OID => (gin::holds(root, rel, index, counted), 0),
         _ => (Vec::new(), 0),
     }
 }
@@ -249,6 +251,7 @@ pub(crate) unsafe fn measure_on_leaves(
     let (held, leaves) = match (*index).relam {
         pg_sys::BTREE_AM_OID => conditions::held_on_leaves(root, rel, index, counted)
             .map_or((None, None), |(h, l)| (Some(h), l)),
+        pg_sys::GIN_AM_OID => (gin::held_except(root, rel, index, counted), None),
         _ => (None, None),
     };
     if depth > 0 {
