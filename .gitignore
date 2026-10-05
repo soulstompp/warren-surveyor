@@ -1,6 +1,9 @@
 # Build output
 /target
 
+# The kit's runs: expected answers and run directories
+/runs
+
 # Your own write-ups, in progress. Local only.
 notes/
 
