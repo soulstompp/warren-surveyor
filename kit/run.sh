@@ -118,11 +118,12 @@ STEP='install'
 say "install: the bench, in this clone"
 cargo build --release --locked -p warren-bench --manifest-path "$REPO/Cargo.toml"
 fact bench "$("$B" --version)"
-if command -v sqlc-brickgen >/dev/null; then
+# The generator on PATH serves if it takes --extension-schema, as 0.0.2 and later do.
+if command -v sqlc-brickgen >/dev/null && sqlc-brickgen --help | grep -q -- '--extension-schema'; then
     GEN=$(command -v sqlc-brickgen)
 else
-    say "install: the generator, sqlc-brickgen, from crates.io into $TOOLS"
-    cargo install --locked sqlc-brickgen --root "$TOOLS"
+    say "install: the generator, sqlc-brickgen 0.0.2, from crates.io into $TOOLS"
+    cargo install --locked sqlc-brickgen --version 0.0.2 --root "$TOOLS"
     GEN="$TOOLS/bin/sqlc-brickgen"
 fi
 if [ "$GEN" = "$TOOLS/bin/sqlc-brickgen" ]; then
@@ -146,7 +147,7 @@ tables=$(q -d "$DB" -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'publi
 [ "$tables" = 8 ] || die "the catalogue's download left $tables tables, not 8"
 started=$SECONDS
 "$GEN" --database-url "$DB" --size "$SIZE" --oo-schema lego_oo --partitioning inheritance,range,hash \
-    > "$OUT/generator.log" 2>&1
+    --extension-schema public > "$OUT/generator.log" 2>&1
 fact load_seconds $((SECONDS - started))
 fact database_size "$(q -d "$DB" -c "SELECT pg_size_pretty(pg_database_size(current_database()))")"
 

@@ -39,12 +39,12 @@ script checks every need in *What you need* below and cargo-pgrx 0.19.2, and nam
 missing with the command that installs it.
 
 Then it runs the steps below in order. It builds the bench inside the clone, installs the generator
-there too unless `sqlc-brickgen` is already on your `PATH`, and installs the extension into the
-server's own directories (give `--sudo` on a server installed by a package manager): the one thing
-it writes outside the clone, but the database. It makes and loads the database (step 1), turns the
-surveyor off and records every answer with PostgreSQL alone (steps 2 and 3), times every question
-with PostgreSQL alone (step 4), turns the surveyor on and times every question with it and without
-it (steps 5 and 6), and turns it off again.
+there too unless the `sqlc-brickgen` on your `PATH` is 0.0.2 or later, and installs the extension
+into the server's own directories (give `--sudo` on a server installed by a package manager): the
+one thing it writes outside the clone, but the database. It makes and loads the database (step 1),
+turns the surveyor off and records every answer with PostgreSQL alone (steps 2 and 3), times every
+question with PostgreSQL alone (step 4), turns the surveyor on and times every question with it and
+without it (steps 5 and 6), and turns it off again.
 
 It ends by printing each run's summary, and leaves every file under `runs/<size>-<time>/` in the
 clone: `run/summary.txt` and `alone/summary.txt`, which step 7 reads, and `facts.txt`, what ran on
@@ -68,13 +68,13 @@ libclang, which pgrx builds against.
 
 ```sh
 cargo install --locked warren-bench --root ~/.local
-cargo install --locked sqlc-brickgen --root ~/.local
+cargo install --locked sqlc-brickgen --version 0.0.2 --root ~/.local
 ```
 
 The first installs the bench, `warren-bench`, which steps 2 to 6 run. It carries the kit inside it:
 the questions and the script that turns the surveyor on and off. The second installs the
-generator, `sqlc-brickgen`, which step 1 runs. Both land in `~/.local/bin`, which must be on your
-`PATH`; without `--root ~/.local`, they land in `~/.cargo/bin`. `warren-bench --version` prints
+generator, `sqlc-brickgen` 0.0.2, which step 1 runs. Both land in `~/.local/bin`, which must be on
+your `PATH`; without `--root ~/.local`, they land in `~/.cargo/bin`. `warren-bench --version` prints
 `warren-bench 0.1.0`, and `sqlc-brickgen --help` its flags.
 
 The extension builds from a clone of this repository, against your server:
@@ -171,7 +171,7 @@ psql -X -d postgres://USER@HOST:5432/postgres -c 'CREATE DATABASE lego'
 curl -sSfL https://raw.githubusercontent.com/neondatabase/postgres-sample-dbs/main/lego.sql \
     | psql -X -q -v ON_ERROR_STOP=1 -d $DB
 sqlc-brickgen --database-url $DB --size small \
-    --oo-schema lego_oo --partitioning inheritance,range,hash
+    --oo-schema lego_oo --partitioning inheritance,range,hash --extension-schema public
 ```
 
 The first two make the kit's database and load the real catalogue into its `public` schema: eight
@@ -189,7 +189,8 @@ kind of theme, colours by hue, builders by country); question 19 reads its colou
 `lego_oo.colour_wheel`, so the questions need this flag. `--partitioning` adds partitioned copies,
 one schema per method: `lego_inheritance`, `lego_range` and `lego_hash`. The questions read `lego`;
 the others give the surveyor classes and partitions to stand on, and you tables for your own
-questions.
+questions. `--extension-schema public` creates the extensions the search indexes need, `cube`,
+`earthdistance` and `pg_trgm`, in `public`, where the questions find them.
 
 The generator ends by printing `SUMMARY` lines: each table's size, then the load's
 `wall_seconds`.
