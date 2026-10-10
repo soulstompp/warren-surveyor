@@ -27,7 +27,8 @@
 -- Both take each table's lock for as long as the transaction lasts: off drops indexes, which waits
 -- for every query on the table. Run it when the database is quiet.
 --
--- Setting session_preload_libraries on a database takes a superuser, or a role granted SET on it.
+-- Setting session_preload_libraries on a database takes a superuser, or from PostgreSQL 15 a role
+-- granted SET on it.
 -- Sessions already open keep the libraries they started with: reconnect after either side.
 
 \set ON_ERROR_STOP on

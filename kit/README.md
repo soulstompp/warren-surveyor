@@ -25,7 +25,7 @@ We would like to hear what you find, the losses most of all.
 
 ## Run it all
 
-On the machine your PostgreSQL 18 server runs on:
+On the machine your PostgreSQL 14 to 18 server runs on:
 
 ```sh
 git clone https://github.com/soulstompp/warren-surveyor
@@ -62,7 +62,7 @@ but the extension's files is inside the clone; the extension comes out as *Unins
 
 To run the steps one by one instead, install the bench, the generator and the surveyor's extension
 once. They need Rust 1.96 or later; the extension also needs cargo-pgrx 0.19.2
-(`cargo install cargo-pgrx --version 0.19.2 --locked`), your PostgreSQL 18's `pg_config`, and, on
+(`cargo install cargo-pgrx --version 0.19.2 --locked`), your PostgreSQL's `pg_config`, and, on
 a server installed by a package manager, its development package (the server's headers) and
 libclang, which pgrx builds against.
 
@@ -83,12 +83,13 @@ The extension builds from a clone of this repository, against your server:
 git clone https://github.com/soulstompp/warren-surveyor
 cd warren-surveyor/warren-surveyor-pg
 PG_CONFIG=/path/to/pg_config
-mkdir -p ~/.pgrx && printf '[configs]\npg18 = "%s"\n' "$PG_CONFIG" > ~/.pgrx/config.toml
+PG_MAJOR=$("$PG_CONFIG" --version | awk '{print $2}' | cut -d. -f1)
+mkdir -p ~/.pgrx && printf '[configs]\npg%s = "%s"\n' "$PG_MAJOR" "$PG_CONFIG" > ~/.pgrx/config.toml
 cargo pgrx install --release --pg-config "$PG_CONFIG"
 ```
 
 pgrx reads where your PostgreSQL is from `~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`): the
-`printf` writes that file, and where it exists already, add the `pg18` line under its `[configs]`
+`printf` writes that file, and where it exists already, add that `pg` line under its `[configs]`
 instead. `cargo pgrx install` builds the extension `warren_surveyor_pg` and copies its library,
 `warren_surveyor_pg.so`, into the directory `"$PG_CONFIG" --pkglibdir` prints, and its control
 file and SQL into the server's extension directory: step 5 creates the extension from them. It is
@@ -99,7 +100,7 @@ manager, add `--sudo`. To see that the server has it, ask:
 SELECT name, default_version FROM pg_available_extensions WHERE name = 'warren_surveyor_pg';
 ```
 
-It gives `0.1.0`. Installing changes no database and no setting: the library acts only in a
+It gives `0.1.1`. Installing changes no database and no setting: the library acts only in a
 session that loads it, and step 5 is the one that has the kit's database load it. To take it all
 back out: `cargo uninstall --root ~/.local warren-bench sqlc-brickgen`; the bench's cache directory,
 `~/.cache/warren-bench` (or under `$XDG_CACHE_HOME`); and the extension, as *Uninstalling* in
@@ -134,14 +135,16 @@ pages first.
 
 ## What you need
 
-- **PostgreSQL 18**, a server you can create a database on, as a superuser: the load creates
-  `earthdistance`, the surveyor's extension is one only a superuser may create, and turning it on
-  sets the database's `session_preload_libraries`. Its `psql`, and the contrib extensions `cube`,
-  `earthdistance` and `pg_trgm`.
+- **PostgreSQL 14 to 18** (14.19, 15.14, 16.10, 17.6 or later), a server you can create a database
+  on, as a superuser: the load creates `earthdistance`, the surveyor's extension is one only a
+  superuser may create, and turning it on sets the database's `session_preload_libraries`. Its
+  `psql`, and the contrib extensions `cube`, `earthdistance` and `pg_trgm`. On 14 and 15, building
+  a surveyor warns that an UPDATE changing one of its columns is no longer HOT.
 - `curl`, and about 4 GB of disk for the small load, which takes under a minute.
 - The bench on the server's own machine, on Linux: it reads each backend's memory from `/proc` to
   stop a statement before it takes the server's memory. For a server elsewhere, give `truth` and
-  `run` `--no-memory-watchdog`. It connects without TLS.
+  `run` `--no-memory-watchdog`. It connects without TLS. On 14 it runs without its rows witness,
+  which needs 15.
 
 Every command below names the database by URL. Write yours in once:
 
