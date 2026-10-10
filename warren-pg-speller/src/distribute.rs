@@ -11,6 +11,7 @@
 //! the same equalities; and where each column the arms return reads that relation alone, the same
 //! expression in every arm, or does not read it at all.
 
+use crate::compat;
 use crate::levels::{from_items, level, movable, plain, secured_by_sublink};
 use crate::nodes::*;
 use crate::reading::{reaches_outside, reads, recount, renumber};
@@ -71,15 +72,7 @@ pub(crate) unsafe fn same_relation(
         (Some(a), Some(b)) if pg_sys::equal(a as *const c_void, b as *const c_void) => {}
         _ => return false,
     }
-    let same_reader = || match ((*x).perminfoindex > 0, (*y).perminfoindex > 0) {
-        (false, false) => true,
-        (true, true) => {
-            let a = pg_sys::getRTEPermissionInfo((*xq).rteperminfos, x);
-            let b = pg_sys::getRTEPermissionInfo((*yq).rteperminfos, y);
-            (*a).checkAsUser == (*b).checkAsUser && (*a).requiredPerms == (*b).requiredPerms
-        }
-        _ => false,
-    };
+    let same_reader = || compat::same_reader(xq, x, yq, y);
     match (*x).rtekind {
         pg_sys::RTEKind::RTE_RELATION => {
             (*x).relid == (*y).relid
@@ -258,9 +251,7 @@ pub(crate) unsafe fn distribute(
         }
         let outputs = targets
             .iter()
-            .map(|&t| {
-                pg_sys::flatten_join_alias_vars(null_mut(), q, (*t).expr as *mut pg_sys::Node)
-            })
+            .map(|&t| compat::flatten_join_alias_vars(q, (*t).expr as *mut pg_sys::Node))
             .collect();
         arms.push(Arm {
             q,
@@ -384,7 +375,7 @@ pub(crate) unsafe fn distributed(
     let leftmost = arms_index(s, 0)?;
     let mut u_targets = Vec::new();
     for (i, k) in kinds.iter().enumerate() {
-        let var = pg_sys::makeVar(leftmost, i as i16 + 1, k.0, k.1, k.2, 0);
+        let var = compat::make_var(leftmost, i as i16 + 1, k.0, k.1, k.2, 0);
         u_targets.push(pg_sys::makeTargetEntry(
             var as *mut pg_sys::Expr,
             i as i16 + 1,
@@ -406,11 +397,7 @@ pub(crate) unsafe fn distributed(
     let original = entry((*arm).rtable, picks[0]);
     let a = copy(original);
     let mut perminfos = null_mut();
-    if (*original).perminfoindex > 0 {
-        let info = copy(pg_sys::getRTEPermissionInfo((*arm).rteperminfos, original));
-        perminfos = pg_sys::lappend(perminfos, info as *mut c_void);
-        (*a).perminfoindex = 1;
-    }
+    compat::copy_permissions(arm, original, a, &mut perminfos);
     // the row security conditions of a table name its own entry
     let size = (*(*arm).rtable).length as usize;
     (*a).securityQuals = match (*a).securityQuals.is_null() {
@@ -469,7 +456,7 @@ pub(crate) unsafe fn distributed(
     let j: *mut pg_sys::Query = made(pg_sys::NodeTag::T_Query);
     (*j).commandType = pg_sys::CmdType::CMD_SELECT;
     (*j).rtable = list(&[a as *mut c_void, u_entry as *mut c_void]);
-    (*j).rteperminfos = perminfos;
+    compat::set_permissions(j, perminfos);
     (*j).jointree = pg_sys::makeFromExpr(references(&[1, 2]), and_of(&quals));
     (*j).targetList = list(&targets);
     (*j).sortClause = copy((*s).sortClause);

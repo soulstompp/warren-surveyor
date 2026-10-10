@@ -6,6 +6,7 @@
 //! column of each of a table's B-trees, the statistics of an index's key column, and whether
 //! ANALYZE read every row of a table.
 
+use crate::compat;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::ffi::c_void;
@@ -39,7 +40,7 @@ pub(crate) unsafe fn every_row_analyzed(relid: pg_sys::Oid) -> bool {
     let mut target = 0;
     let columns = (*(*rel).rd_att).natts;
     for attnum in 1..=columns {
-        let attribute = pg_sys::TupleDescAttr((*rel).rd_att, attnum - 1);
+        let attribute = compat::attribute((*rel).rd_att, attnum - 1);
         if !(*attribute).attisdropped {
             target = target.max(column_target(relid, attnum as i16));
         }

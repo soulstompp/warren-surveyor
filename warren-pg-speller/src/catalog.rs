@@ -4,6 +4,7 @@
 //! What the catalog says about each table a statement reads: its unique keys and its NOT NULL
 //! columns, read once for each statement.
 
+use crate::compat;
 use crate::nodes::oids;
 use pgrx::pg_sys;
 use std::collections::HashMap;
@@ -57,7 +58,7 @@ pub(crate) unsafe fn load(relid: pg_sys::Oid) -> Table {
                 if c <= 0 {
                     return false;
                 }
-                let attribute = pg_sys::TupleDescAttr(desc, c as c_int - 1);
+                let attribute = compat::attribute(desc, c as c_int - 1);
                 let default =
                     pg_sys::GetDefaultOpClass((*attribute).atttypid, pg_sys::BTREE_AM_OID);
                 let collation = (*attribute).attcollation;
@@ -77,9 +78,7 @@ pub(crate) unsafe fn load(relid: pg_sys::Oid) -> Table {
     let natts = (*desc).natts as usize;
     let mut not_null = vec![false; natts + 1];
     for i in 0..natts {
-        let attribute = pg_sys::TupleDescCompactAttr(desc, i as c_int);
-        not_null[i + 1] = (*attribute).attnullability as u8 == pg_sys::ATTNULLABLE_VALID
-            && !(*attribute).attisdropped;
+        not_null[i + 1] = compat::not_null(desc, i as c_int);
     }
     let has_children = (*(*rel).rd_rel).relhassubclass;
     let partitioned = (*(*rel).rd_rel).relkind as u8 == pg_sys::RELKIND_PARTITIONED_TABLE;

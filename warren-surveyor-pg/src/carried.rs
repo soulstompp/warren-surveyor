@@ -23,6 +23,7 @@
 //! the table and what is left of the statement's planning-read budget (`budget`). A block whose
 //! leaves would pass either is counted from its five leaves.
 
+use crate::compat;
 use crate::conditions::{column_of, compares_as, constant, strategy};
 use crate::measure::{self, End, Leaf, Part};
 use crate::query::{bare, cells};
@@ -265,14 +266,14 @@ unsafe fn stored(
                 return None;
             }
             let var = v as *mut pg_sys::Var;
-            if (*var).varno != (*rel).relid as i32 || (*var).varlevelsup != 0 {
+            if compat::varno(var) != (*rel).relid as i32 || (*var).varlevelsup != 0 {
                 return None;
             }
             (0..(*index).ncolumns as usize)
                 .find(|&i| *(*index).indexkeys.add(i) == (*var).varattno as i32)?
         }
     };
-    let kept = (*pg_sys::TupleDescAttr(desc, at as i32)).atttypid;
+    let kept = (*compat::attribute(desc, at as i32)).atttypid;
     (kept == pg_sys::exprType(bare(value))).then_some(at + 1)
 }
 

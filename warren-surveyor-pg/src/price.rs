@@ -35,6 +35,7 @@
 //! The descent's comparisons and pages, the entries' and conditions' work, and the table's pages
 //! are priced as the B-tree prices them.
 
+use crate::compat;
 use crate::conditions;
 use crate::measure;
 use crate::query::{cells, examine_indexcol, release, surveyed, surveyor_am};
@@ -132,7 +133,7 @@ pub(crate) struct Estimate {
     pub order: Option<f64>,
 }
 
-type PriceFunction = unsafe extern "C-unwind" fn(
+pub(crate) type PriceFunction = unsafe extern "C-unwind" fn(
     *mut pg_sys::PlannerInfo,
     *mut pg_sys::IndexPath,
     f64,
@@ -169,7 +170,7 @@ pub fn init() {
         GucFlags::UNIT_BLOCKS,
     );
     unsafe {
-        pg_sys::MarkGUCPrefixReserved(c"warren_surveyor_pg".as_ptr());
+        compat::reserve_prefix(c"warren_surveyor_pg".as_ptr());
         NEXT_INFO = pg_sys::get_relation_info_hook;
         pg_sys::get_relation_info_hook = Some(relation_info);
     }
@@ -222,7 +223,7 @@ unsafe extern "C-unwind" fn relation_info(
         if (*index).relam == pg_sys::BTREE_AM_OID
             && (*index).amcostestimate.map(|f| f as usize) == Some(own as usize)
         {
-            (*index).amcostestimate = Some(priced);
+            compat::set_index_price(index, priced);
         }
     }
 }
@@ -251,7 +252,7 @@ unsafe fn shared_buffers() -> f64 {
 }
 
 /// The pages of each relation of this database held in shared buffers, by its tablespace and file.
-type Resident = HashMap<(pg_sys::Oid, pg_sys::RelFileNumber), f64>;
+type Resident = HashMap<(pg_sys::Oid, compat::RelFileNumber), f64>;
 
 thread_local! {
     /// The pages of each relation held in shared buffers, counted once in the round of planning.
@@ -277,12 +278,13 @@ unsafe fn count_resident() -> Resident {
         let desc = std::ptr::addr_of_mut!((*pg_sys::BufferDescriptors.add(at)).bufferdesc);
         let state = pg_sys::LockBufHdr(desc);
         let tag = (*desc).tag;
-        pg_sys::UnlockBufHdr(desc, state);
+        compat::unlock_buffer_header(desc, state);
+        let (database, space, file) = compat::tagged(&tag);
         if state & valid == valid
             && tag.forkNum == pg_sys::ForkNumber::MAIN_FORKNUM
-            && tag.dbOid == pg_sys::MyDatabaseId
+            && database == pg_sys::MyDatabaseId
         {
-            *counts.entry((tag.spcOid, tag.relNumber)).or_insert(0.0) += 1.0;
+            *counts.entry((space, file)).or_insert(0.0) += 1.0;
         }
     }
     counts
@@ -292,7 +294,7 @@ unsafe fn count_resident() -> Resident {
 unsafe fn resident_share(index: *mut pg_sys::IndexOptInfo) -> f64 {
     // the planner already holds its lock on the index
     let rel = pg_sys::index_open((*index).indexoid, pg_sys::NoLock as pg_sys::LOCKMODE);
-    let at = ((*rel).rd_locator.spcOid, (*rel).rd_locator.relNumber);
+    let at = compat::relation_file(rel);
     pg_sys::index_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
     let of = |counts: &Resident| counts.get(&at).copied().unwrap_or(0.0);
     let resident = if round::depth() == 0 {
@@ -674,7 +676,7 @@ pub(crate) unsafe fn estimate(
                 pg_sys::NodeTag::T_ScalarArrayOpExpr => {
                     let saop = node as *mut pg_sys::ScalarArrayOpExpr;
                     let array = cells((*saop).args)[1] as *mut pg_sys::Node;
-                    let length = pg_sys::estimate_array_length(root, array);
+                    let length = compat::estimate_array_length(root, array);
                     operator = (*saop).opno;
                     found_array = true;
                     if length > 1.0 {
@@ -735,7 +737,7 @@ pub(crate) unsafe fn estimate(
             let node = (*(qual as *mut pg_sys::RestrictInfo)).clause as *mut pg_sys::Node;
             if tag(node) == pg_sys::NodeTag::T_ScalarArrayOpExpr {
                 let saop = node as *mut pg_sys::ScalarArrayOpExpr;
-                let length = pg_sys::estimate_array_length(
+                let length = compat::estimate_array_length(
                     root,
                     cells((*saop).args)[1] as *mut pg_sys::Node,
                 );

@@ -3,6 +3,7 @@
 
 //! Reading PostgreSQL's lists and building the nodes of a statement.
 
+use crate::compat;
 use pgrx::pg_sys;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr::null_mut;
@@ -95,7 +96,7 @@ pub(crate) unsafe fn select_of(
     (*q).querySource = pg_sys::QuerySource::QSRC_ORIGINAL;
     (*q).canSetTag = true;
     (*q).rtable = (*pstate).p_rtable;
-    (*q).rteperminfos = (*pstate).p_rteperminfos;
+    compat::set_permissions(q, compat::parsed_permissions(pstate));
     (*q).jointree = pg_sys::makeFromExpr(references(from), quals);
     (*q).targetList = targets;
     q
@@ -300,7 +301,7 @@ pub(crate) unsafe fn column_var(
     resno: i16,
     target: *mut pg_sys::Node,
 ) -> *mut pg_sys::Node {
-    pg_sys::makeVar(
+    compat::make_var(
         varno,
         resno,
         pg_sys::exprType(target),

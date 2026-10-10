@@ -9,13 +9,24 @@ use pgrx::prelude::*;
 use std::ffi::{c_int, c_void};
 use std::ptr::null_mut;
 
-/// Builds nothing, and reports no count of rows, so the table's own count is left as it was.
+/// Builds nothing, and reports no count of rows, so the table's own count is left as it was. On
+/// PostgreSQL 14 and 15 it warns that an UPDATE changing a column it names is no longer HOT.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn build(
     _heap: pg_sys::Relation,
-    _index: pg_sys::Relation,
+    index: pg_sys::Relation,
     _info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    {
+        let name = std::ffi::CStr::from_ptr((*(*index).rd_rel).relname.data.as_ptr());
+        warning!(
+            "an UPDATE that changes a column surveyor \"{}\" names is no longer HOT",
+            name.to_string_lossy()
+        );
+    }
+    #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+    let _ = index;
     let result = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBuildResult>())
         as *mut pg_sys::IndexBuildResult;
     (*result).heap_tuples = -1.0;

@@ -39,6 +39,7 @@
 //! and is often deleted before the drive ever writes it, so a drive's price of a page read alone,
 //! declared on its tablespace, weighs the lookups that read from it and no spill.
 
+use crate::compat;
 use crate::query::surveyor_am;
 use crate::round;
 use pgrx::pg_sys;
@@ -223,7 +224,7 @@ unsafe fn carries_surveyor(
         }
         let index = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_index>(tuple);
         // an index being dropped is not read
-        if (*index).indislive && pg_sys::get_rel_relam((*index).indexrelid) == am {
+        if (*index).indislive && compat::get_rel_relam((*index).indexrelid) == am {
             carries = true;
             break;
         }
@@ -868,13 +869,7 @@ pub(crate) mod tests {
             let text = CString::new("SELECT 1 / 0 FROM watched").unwrap();
             let raw = pg_sys::pg_parse_query(text.as_ptr());
             let stmt = (*(*raw).elements).ptr_value as *mut pg_sys::RawStmt;
-            let queries = pg_sys::pg_analyze_and_rewrite_fixedparams(
-                stmt,
-                text.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null_mut(),
-            );
+            let queries = crate::compat::analyze_and_rewrite(stmt, text.as_ptr());
             let query = (*(*queries).elements).ptr_value as *mut pg_sys::Query;
             let context = pg_sys::CurrentMemoryContext;
             let failed = PgTryBuilder::new(|| {

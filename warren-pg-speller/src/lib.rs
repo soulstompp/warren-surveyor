@@ -31,6 +31,7 @@
 //! `shared_preload_libraries`, `session_preload_libraries`, or `LOAD`.
 
 mod catalog;
+mod compat;
 mod distribute;
 mod fold;
 mod keep;

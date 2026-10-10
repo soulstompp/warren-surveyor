@@ -3,6 +3,7 @@
 
 //! What an expression reads, and moving it between query levels.
 
+use crate::compat::{set_varno, varno};
 use crate::nodes::cells;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
@@ -25,8 +26,8 @@ pub(crate) unsafe fn reads(node: *mut pg_sys::Node) -> Vec<c_int> {
         match (*node).type_ {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
-                if (*var).varlevelsup == c.depth && !c.state.contains(&(*var).varno) {
-                    c.state.push((*var).varno);
+                if (*var).varlevelsup == c.depth && !c.state.contains(&varno(var)) {
+                    c.state.push(varno(var));
                 }
                 false
             }
@@ -101,11 +102,11 @@ pub(crate) unsafe fn renumber(node: *mut pg_sys::Node, map: &[c_int]) -> bool {
             pg_sys::NodeTag::T_Var => {
                 let var = node as *mut pg_sys::Var;
                 if (*var).varlevelsup == c.depth {
-                    let to = c.state.map.get((*var).varno as usize).copied().unwrap_or(0);
+                    let to = c.state.map.get(varno(var) as usize).copied().unwrap_or(0);
                     if to == 0 {
                         c.state.missing = true;
                     } else {
-                        (*var).varno = to;
+                        set_varno(var, to);
                         (*var).varnosyn = to as pg_sys::Index;
                         (*var).varattnosyn = (*var).varattno;
                     }

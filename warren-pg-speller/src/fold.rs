@@ -13,6 +13,7 @@
 //! join; and where every join of the query is an inner join.
 
 use crate::catalog::Facts;
+use crate::compat::{expression_tree_mutator, varno};
 use crate::keep::{held_by, unused_name, with_query};
 use crate::levels::{flat, level, movable, Flat};
 use crate::nodes::*;
@@ -142,7 +143,7 @@ pub(crate) struct Member {
 
 impl Member {
     unsafe fn at(&self) -> (c_int, i16) {
-        ((*self.var).varno, (*self.var).varattno)
+        (varno(self.var), (*self.var).varattno)
     }
 }
 
@@ -187,7 +188,7 @@ pub(crate) unsafe fn reached_from(
     equalities: &[(usize, Member, Member)],
     key: &[Member],
 ) -> Option<bool> {
-    let grain = (*u).varno;
+    let grain = varno(u);
     let t = facts.own_rows(entry((*f.q).rtable, grain))?;
     if !t.keyed_by(&[(*u).varattno]) {
         return None;
@@ -597,7 +598,7 @@ unsafe extern "C-unwind" fn outer_mutator(
             o.stray = true;
             node
         }
-        _ => pg_sys::expression_tree_mutator_impl(node, Some(outer_mutator), context),
+        _ => expression_tree_mutator(node, outer_mutator, context),
     }
 }
 

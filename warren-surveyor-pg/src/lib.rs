@@ -15,6 +15,7 @@ use pgrx::prelude::*;
 mod budget;
 mod carried;
 mod closure;
+mod compat;
 #[allow(dead_code)]
 mod conditions;
 mod drive;
@@ -105,7 +106,14 @@ CREATE OPERATOR CLASS interval_ops DEFAULT FOR TYPE interval USING surveyor AS
     FUNCTION 1 interval_cmp(interval, interval);
 CREATE OPERATOR CLASS time_ops DEFAULT FOR TYPE time USING surveyor AS
     FUNCTION 1 time_cmp(time, time);
+"#,
+    name = "surveyor",
+);
 
+// a warren key is collated by pg_c_utf8 from PostgreSQL 17, and by "C" before
+#[cfg(not(any(feature = "pg14", feature = "pg15", feature = "pg16")))]
+extension_sql!(
+    r#"
 -- the text type of a warren key: compared by code point, whatever the operating system's locale data;
 -- where the schema already has one, it is kept only where another extension made it as the same
 -- domain and a superuser owns it, since whoever owns the type may attach a check that runs as
@@ -132,7 +140,39 @@ BEGIN
 END
 $warren_key$;
 "#,
-    name = "surveyor",
+    name = "warren_key",
+);
+
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+extension_sql!(
+    r#"
+-- the text type of a warren key: compared by code point, whatever the operating system's locale data;
+-- where the schema already has one, it is kept only where another extension made it as the same
+-- domain and a superuser owns it, since whoever owns the type may attach a check that runs as
+-- whoever writes a key; any other type of that name stops the extension from being created
+DO $warren_key$
+DECLARE
+    found oid;
+BEGIN
+    SELECT oid INTO found FROM pg_type
+    WHERE typname = 'warren_key' AND typnamespace = '@extschema@'::regnamespace;
+    IF found IS NULL THEN
+        CREATE DOMAIN warren_key AS text COLLATE "C";
+    ELSIF NOT EXISTS (
+        SELECT 1 FROM pg_type t JOIN pg_roles r ON r.oid = t.typowner
+        WHERE t.oid = found AND t.typtype = 'd' AND t.typbasetype = 'text'::regtype
+          AND t.typcollation = 'pg_catalog."C"'::regcollation AND r.rolsuper
+          AND EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_type'::regclass AND d.objid = found AND d.deptype = 'e')
+    ) THEN
+        RAISE EXCEPTION 'type %.warren_key exists, and is not a domain over text with collation "C" that an extension made and a superuser owns', '@extschema@'
+            USING ERRCODE = 'duplicate_object',
+                  HINT = 'Drop or rename that type, then create the extension again.';
+    END IF;
+END
+$warren_key$;
+"#,
+    name = "warren_key",
 );
 
 #[no_mangle]
@@ -155,9 +195,12 @@ pub unsafe extern "C-unwind" fn surveyor_handler(
     am.amoptsprocnum = 0;
     am.amcanorder = false;
     am.amcanorderbyop = false;
-    am.amcanhash = false;
-    am.amconsistentequality = false;
-    am.amconsistentordering = false;
+    #[cfg(any(feature = "pg18", feature = "pg19"))]
+    {
+        am.amcanhash = false;
+        am.amconsistentequality = false;
+        am.amconsistentordering = false;
+    }
     am.amcanbackward = false;
     am.amcanunique = false;
     am.amcanmulticol = true;
@@ -168,11 +211,17 @@ pub unsafe extern "C-unwind" fn surveyor_handler(
     am.amclusterable = false;
     am.ampredlocks = false;
     am.amcanparallel = false;
-    am.amcanbuildparallel = false;
+    #[cfg(not(any(feature = "pg14", feature = "pg15", feature = "pg16")))]
+    {
+        am.amcanbuildparallel = false;
+    }
     am.amcaninclude = false;
     am.amusemaintenanceworkmem = false;
     // an update that changes only the columns a surveyor names stays HOT
-    am.amsummarizing = true;
+    #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+    {
+        am.amsummarizing = true;
+    }
     am.amparallelvacuumoptions = pg_sys::VACUUM_OPTION_NO_PARALLEL as u8;
     am.amkeytype = pg_sys::InvalidOid;
 
@@ -247,7 +296,7 @@ mod tests {
     /// a server built with assertions draws from that state on every miss of its catalog caches.
     #[pg_extern]
     fn same_gist_every_run() {
-        unsafe { pg_sys::pg_prng_seed(std::ptr::addr_of_mut!(pg_sys::pg_global_prng_state), 1) };
+        unsafe { crate::compat::seed_random(1) };
     }
 
     fn plan(sql: &str) -> String {

@@ -31,6 +31,7 @@
 //! values. Where the prediction passes the pages of the table, or what is left of the statement's
 //! planning-read budget, the read never starts and the conditions are left to the planner.
 
+use crate::compat;
 use crate::leaves;
 use crate::measure::{self, End, Part};
 use crate::query::{bare, cells, distinct_of};
@@ -87,7 +88,7 @@ pub(crate) unsafe fn column_of(
         if key != 0 {
             if tag(expr) == pg_sys::NodeTag::T_Var {
                 let v = expr as *mut pg_sys::Var;
-                if (*v).varno == (*rel).relid as i32
+                if compat::varno(v) == (*rel).relid as i32
                     && (*v).varattno == key as i16
                     && (*v).varlevelsup == 0
                 {
@@ -526,7 +527,7 @@ unsafe fn key_expression(
             &mut typmod,
             &mut collation,
         );
-        return Some(pg_sys::makeVar(
+        return Some(compat::make_var(
             (*rel).relid as i32,
             key as pg_sys::AttrNumber,
             kind,

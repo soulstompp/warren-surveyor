@@ -3,6 +3,7 @@
 
 //! A query level read as relations side by side, and a query level made from some of them.
 
+use crate::compat;
 use crate::nodes::*;
 use crate::reading::renumber;
 use pgrx::pg_sys;
@@ -52,7 +53,7 @@ pub(crate) unsafe fn from_items(
     }
     let quals = quals
         .into_iter()
-        .map(|c| pg_sys::flatten_join_alias_vars(null_mut(), q, c))
+        .map(|c| compat::flatten_join_alias_vars(q, c))
         .collect();
     Some((items, quals))
 }
@@ -69,7 +70,7 @@ pub(crate) unsafe fn plain(q: *mut pg_sys::Query) -> bool {
         && !(*q).hasForUpdate
         && !(*q).hasModifyingCTE
         && !(*q).hasRecursive
-        && !(*q).hasGroupRTE
+        && !compat::has_group_rte(q)
         && (*q).groupClause.is_null()
         && (*q).groupingSets.is_null()
         && (*q).havingQual.is_null()
@@ -111,16 +112,14 @@ pub(crate) struct Flat {
 /// FROM read as the relations it joins.
 pub(crate) unsafe fn flat(q: *mut pg_sys::Query) -> Option<Flat> {
     let f = copy(q);
-    if (*f).hasGroupRTE {
-        (*f).targetList =
-            pg_sys::flatten_group_exprs(null_mut(), f, (*f).targetList as *mut pg_sys::Node)
-                as *mut pg_sys::List;
-        (*f).havingQual = pg_sys::flatten_group_exprs(null_mut(), f, (*f).havingQual);
-    }
-    (*f).targetList =
-        pg_sys::flatten_join_alias_vars(null_mut(), f, (*f).targetList as *mut pg_sys::Node)
+    if compat::has_group_rte(f) {
+        (*f).targetList = compat::flatten_group_exprs(f, (*f).targetList as *mut pg_sys::Node)
             as *mut pg_sys::List;
-    (*f).havingQual = pg_sys::flatten_join_alias_vars(null_mut(), f, (*f).havingQual);
+        (*f).havingQual = compat::flatten_group_exprs(f, (*f).havingQual);
+    }
+    (*f).targetList = compat::flatten_join_alias_vars(f, (*f).targetList as *mut pg_sys::Node)
+        as *mut pg_sys::List;
+    (*f).havingQual = compat::flatten_join_alias_vars(f, (*f).havingQual);
     let (mut items, mut quals) = from_items(f)?;
     loop {
         let mut changed = false;
@@ -201,7 +200,7 @@ pub(crate) unsafe fn pull_up(
     if (*e).lateral
         || (*e).security_barrier
         || !(*e).securityQuals.is_null()
-        || (*e).perminfoindex != 0
+        || compat::is_view(e)
         || (*e).subquery.is_null()
         || !plain((*e).subquery)
     {
@@ -215,9 +214,8 @@ pub(crate) unsafe fn pull_up(
         return None;
     }
     pg_sys::IncrementVarSublevelsUp(sub as *mut pg_sys::Node, -1, 1);
-    (*sub).targetList =
-        pg_sys::flatten_join_alias_vars(null_mut(), sub, (*sub).targetList as *mut pg_sys::Node)
-            as *mut pg_sys::List;
+    (*sub).targetList = compat::flatten_join_alias_vars(sub, (*sub).targetList as *mut pg_sys::Node)
+        as *mut pg_sys::List;
     let (items, conditions) = from_items(sub)?;
     let offset = (*(*f).rtable).length;
     // the row security conditions of a table name its own entry
@@ -225,29 +223,14 @@ pub(crate) unsafe fn pull_up(
         let x = x as *mut pg_sys::RangeTblEntry;
         pg_sys::OffsetVarNodes((*x).securityQuals as *mut pg_sys::Node, offset, 0);
     }
-    pg_sys::CombineRangeTables(
-        &mut (*f).rtable,
-        &mut (*f).rteperminfos,
-        (*sub).rtable,
-        (*sub).rteperminfos,
-    );
+    compat::combine_range_tables(f, sub);
     pg_sys::OffsetVarNodes((*sub).targetList as *mut pg_sys::Node, offset, 0);
     for &c in &conditions {
         pg_sys::OffsetVarNodes(c, offset, 0);
     }
     let mut sublinks = (*f).hasSubLinks;
     let replace = |node: *mut pg_sys::Node, sublinks: &mut bool| {
-        pg_sys::ReplaceVarsFromTargetList(
-            node,
-            index,
-            0,
-            e,
-            (*sub).targetList,
-            0,
-            pg_sys::ReplaceVarsNoMatchOption::REPLACEVARS_REPORT_ERROR,
-            0,
-            sublinks,
-        )
+        compat::replace_vars(node, index, e, (*sub).targetList, sublinks)
     };
     (*f).targetList =
         replace((*f).targetList as *mut pg_sys::Node, &mut sublinks) as *mut pg_sys::List;
@@ -286,14 +269,7 @@ pub(crate) unsafe fn level(
     for &i in items {
         let original = entry((*source).rtable, i);
         let e = copy(original);
-        if (*original).perminfoindex > 0 {
-            let info = copy(pg_sys::getRTEPermissionInfo(
-                (*source).rteperminfos,
-                original,
-            ));
-            perminfos = pg_sys::lappend(perminfos, info as *mut c_void);
-            (*e).perminfoindex = (*perminfos).length as pg_sys::Index;
-        }
+        compat::copy_permissions(source, original, e, &mut perminfos);
         // the row security conditions of a table name its own entry
         if !renumber((*e).securityQuals as *mut pg_sys::Node, &map) {
             return None;
@@ -324,7 +300,7 @@ pub(crate) unsafe fn level(
     (*q).querySource = pg_sys::QuerySource::QSRC_ORIGINAL;
     (*q).canSetTag = true;
     (*q).rtable = rtable;
-    (*q).rteperminfos = perminfos;
+    compat::set_permissions(q, perminfos);
     let refs: Vec<c_int> = (1..=items.len() as c_int).collect();
     (*q).jointree = pg_sys::makeFromExpr(references(&refs), and_of(&conditions));
     (*q).targetList = list(&entries);

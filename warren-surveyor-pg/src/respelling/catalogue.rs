@@ -172,13 +172,7 @@ pub(crate) fn respelled(sql: &str) -> bool {
         let text = CString::new(sql).unwrap();
         let raw = pg_sys::pg_parse_query(text.as_ptr());
         let stmt = (*(*raw).elements).ptr_value as *mut pg_sys::RawStmt;
-        let queries = pg_sys::pg_analyze_and_rewrite_fixedparams(
-            stmt,
-            text.as_ptr(),
-            std::ptr::null(),
-            0,
-            null_mut(),
-        );
+        let queries = crate::compat::analyze_and_rewrite(stmt, text.as_ptr());
         let query = (*(*queries).elements).ptr_value as *mut pg_sys::Query;
         let copy = || pg_sys::copyObjectImpl(query as *const c_void) as *mut pg_sys::Query;
         let options = pg_sys::CURSOR_OPT_PARALLEL_OK as i32;
