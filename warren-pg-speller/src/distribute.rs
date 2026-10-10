@@ -13,7 +13,7 @@
 
 use crate::levels::{from_items, level, movable, plain, secured_by_sublink};
 use crate::nodes::*;
-use crate::reading::{reaches_outside, reads, renumber};
+use crate::reading::{reaches_outside, reads, recount, renumber};
 use crate::Net;
 use pgrx::pg_sys;
 use std::ffi::{c_int, c_void, CStr};
@@ -485,24 +485,10 @@ pub(crate) unsafe fn distributed(
         || pg_sys::checkExprHasSubLink((*j).limitOffset)
         || secured_by_sublink((*j).rtable);
     let j = in_place_of(s, j)?;
-    // a WITH query the arms read is read once
-    if (*original).rtekind == pg_sys::RTEKind::RTE_CTE {
-        let up = (*original).ctelevelsup as usize;
-        let owner = if up == 1 {
-            Some(j)
-        } else {
-            outer.len().checked_sub(up - 1).map(|i| outer[i])
-        };
-        if let Some(owner) = owner {
-            let name = CStr::from_ptr((*original).ctename);
-            for c in cells((*owner).cteList) {
-                let c = c as *mut pg_sys::CommonTableExpr;
-                if CStr::from_ptr((*c).ctename) == name {
-                    (*c).cterefcount -= arms.len() as c_int - 1;
-                }
-            }
-        }
-    }
+    // each WITH query `j` can read counts the readers it has left
+    let mut levels = outer.to_vec();
+    levels.push(j);
+    recount(levels[0], s, j, &levels);
     Some(j)
 }
 

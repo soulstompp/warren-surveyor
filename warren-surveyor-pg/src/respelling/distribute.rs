@@ -33,6 +33,29 @@ mod tests {
         rows
     }
 
+    /// Each purchase with the set of its collection row.
+    const BOUGHT: &str = "SELECT p.purchase_id, c.set_num FROM lego_purchases p \
+        JOIN lego_collection c ON c.builder_id = p.builder_id AND c.row_no = p.row_no";
+
+    /// For each part category, the purchases whose set's version 1 inventory, or that of a set
+    /// nested in it, holds its lines, and the bricks those lines bring; each arm reads the
+    /// purchases as `{bought}`, and `{named}` opens the WITH queries.
+    const CATEGORIES_OVER_ARMS: &str = "WITH {named} inventory AS ( \
+            SELECT bt.purchase_id, bt.set_num, i.id AS inventory_id, 1 AS copies \
+            FROM {bought} bt JOIN lego_inventories i ON i.set_num = bt.set_num AND i.version = 1 \
+            UNION ALL \
+            SELECT bt.purchase_id, bt.set_num, ci.id, sub.quantity \
+            FROM {bought} bt JOIN lego_inventories i ON i.set_num = bt.set_num AND i.version = 1 \
+            JOIN lego_inventory_sets sub ON sub.inventory_id = i.id \
+            JOIN lego_inventories ci ON ci.set_num = sub.set_num AND ci.version = 1) \
+        SELECT pc.name AS category, count(DISTINCT inv.purchase_id) AS purchases, \
+               sum(ip.quantity * inv.copies) AS bricks \
+        FROM inventory inv \
+        JOIN lego_inventory_parts ip ON ip.inventory_id = inv.inventory_id \
+        JOIN lego_parts pt ON pt.part_num = ip.part_num \
+        JOIN lego_part_categories pc ON pc.id = pt.part_cat_id \
+        GROUP BY 1 ORDER BY 1";
+
     #[pg_test]
     fn a_relation_joined_alike_in_every_arm_of_a_union_all_is_read_once() {
         lego(Indexes::Surveyors);
@@ -57,6 +80,43 @@ mod tests {
         let answer = sorted(rows(NESTED_ARMS));
         assert!(answer.len() > 100, "{}", answer.len());
         assert_eq!(answer, sorted(rows(&written)));
+    }
+
+    #[pg_test]
+    fn a_with_query_read_through_a_subquery_in_every_arm_is_respelled_as_its_body_in_every_arm() {
+        lego(Indexes::Surveyors);
+        // the purchases named once, as a WITH query each arm reads through a subquery
+        let named = CATEGORIES_OVER_ARMS
+            .replace("{named}", &format!("bought AS ({BOUGHT}),"))
+            .replace("{bought}", "(SELECT * FROM bought)");
+        let in_each_arm = CATEGORIES_OVER_ARMS
+            .replace("{named}", "")
+            .replace("{bought}", &format!("({BOUGHT})"));
+        for (form, query) in [("named once", &named), ("in each arm", &in_each_arm)] {
+            assert!(respelled(query), "{form}");
+            let plan = explain(query);
+            assert!(
+                grouped_apart(&plan, " on lego_purchases", " on lego_inventory_parts"),
+                "{form}\n{plan}"
+            );
+            assert!(
+                grouped_apart(&plan, " on lego_inventory_parts", " on lego_purchases"),
+                "{form}\n{plan}"
+            );
+            assert!(
+                grouped_with(
+                    &plan,
+                    " on lego_inventory_parts",
+                    " on lego_purchases",
+                    "CTE Scan on side_a"
+                ),
+                "{form}\n{plan}"
+            );
+            assert!(!plan.contains("CTE Scan on bought"), "{form}\n{plan}");
+        }
+        let answer = rows(&named);
+        assert!(answer.len() > 5, "{answer:?}");
+        assert_eq!(answer, rows(&in_each_arm));
     }
 
     #[pg_test]

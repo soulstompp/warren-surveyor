@@ -3,9 +3,10 @@
 
 //! What an expression reads, and moving it between query levels.
 
+use crate::nodes::cells;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, CStr};
 
 /// A walker's place: how many queries below the level it was started at.
 pub(crate) struct Depth<T> {
@@ -130,6 +131,83 @@ pub(crate) unsafe fn renumber(node: *mut pg_sys::Node, map: &[c_int]) -> bool {
     };
     walker(node, &mut c as *mut Depth<State> as *mut c_void);
     !c.state.missing
+}
+
+/// Gives each WITH query of the queries `levels` the count of its readers in `top`, read with `to`
+/// in the place of `from`. `levels` are `top` and queries inside it.
+pub(crate) unsafe fn recount(
+    top: *mut pg_sys::Query,
+    from: *mut pg_sys::Query,
+    to: *mut pg_sys::Query,
+    levels: &[*mut pg_sys::Query],
+) {
+    struct State {
+        from: *mut pg_sys::Query,
+        to: *mut pg_sys::Query,
+        /// The queries the walker is inside, the outermost first.
+        around: Vec<*mut pg_sys::Query>,
+        /// Each WITH query of `levels`, the query that holds it, and its readers so far.
+        ctes: Vec<(*mut pg_sys::Query, *mut pg_sys::CommonTableExpr, c_int)>,
+    }
+    #[pg_guard]
+    unsafe extern "C-unwind" fn walker(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+        if node.is_null() {
+            return false;
+        }
+        let c = &mut *(context as *mut State);
+        match (*node).type_ {
+            pg_sys::NodeTag::T_RangeTblEntry => {
+                let e = node as *mut pg_sys::RangeTblEntry;
+                if (*e).rtekind != pg_sys::RTEKind::RTE_CTE || (*e).self_reference {
+                    return false;
+                }
+                let Some(at) = c.around.len().checked_sub((*e).ctelevelsup as usize + 1) else {
+                    return false;
+                };
+                let (owner, name) = (c.around[at], CStr::from_ptr((*e).ctename));
+                for (q, cte, readers) in c.ctes.iter_mut() {
+                    if *q == owner && CStr::from_ptr((**cte).ctename) == name {
+                        *readers += 1;
+                    }
+                }
+                false
+            }
+            pg_sys::NodeTag::T_Query => {
+                let mut q = node as *mut pg_sys::Query;
+                if q == c.from {
+                    q = c.to;
+                }
+                c.around.push(q);
+                let r = pg_sys::query_tree_walker(
+                    q,
+                    Some(walker),
+                    context,
+                    pg_sys::QTW_EXAMINE_RTES_BEFORE as c_int,
+                );
+                c.around.pop();
+                r
+            }
+            _ => pg_sys::expression_tree_walker(node, Some(walker), context),
+        }
+    }
+    let mut c = State {
+        from,
+        to,
+        around: Vec::new(),
+        ctes: Vec::new(),
+    };
+    for &q in levels {
+        for cte in cells((*q).cteList) {
+            c.ctes.push((q, cte as *mut pg_sys::CommonTableExpr, 0));
+        }
+    }
+    walker(
+        top as *mut pg_sys::Node,
+        &mut c as *mut State as *mut c_void,
+    );
+    for (_, cte, readers) in c.ctes {
+        (*cte).cterefcount = readers;
+    }
 }
 
 /// Makes `q`, built from what a query level read, a query one level below that level, whose WITH
