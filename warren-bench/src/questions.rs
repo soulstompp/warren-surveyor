@@ -57,6 +57,8 @@ pub struct QuestionSet {
     /// Per question, its text, where the questions are plain `.sql` files sent as written; empty
     /// where they are templates.
     pub plain: BTreeMap<String, String>,
+    /// The flags `cargo sqlc compose` composes the templates with, beyond the source and target.
+    pub flags: Vec<String>,
 }
 
 fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -214,6 +216,29 @@ fn fingerprint_of(dir: &Path, binds_file: &Path) -> Result<String, String> {
 }
 
 impl QuestionSet {
+    /// The set, its templates composed with `cargo sqlc compose --with` where `with`, and
+    /// `--respell` where `respell`. Its fingerprint follows the flags. Plain questions take neither.
+    pub fn composed_with(mut self, with: bool, respell: bool) -> Result<Self, String> {
+        let flags: Vec<String> = [(with, "--with"), (respell, "--respell")]
+            .into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, flag)| flag.to_string())
+            .collect();
+        if flags.is_empty() {
+            return Ok(self);
+        }
+        if self.is_plain() {
+            return Err(format!(
+                "{}: plain questions are sent as written, and {} composes templates",
+                self.dir.display(),
+                flags.join(" and ")
+            ));
+        }
+        self.hash = fingerprint(&[self.hash.as_bytes(), flags.join(" ").as_bytes()]);
+        self.flags = flags;
+        Ok(self)
+    }
+
     /// Whether the questions are plain `.sql` files, sent as written.
     pub fn is_plain(&self) -> bool {
         !self.plain.is_empty()
@@ -269,6 +294,7 @@ impl QuestionSet {
             questions: questions_of(&names, &binds),
             hash: fingerprint_of(dir, binds_file)?,
             plain: texts,
+            flags: vec![],
         })
     }
 
@@ -314,6 +340,7 @@ impl QuestionSet {
             questions: questions_of(&names, &binds),
             hash: fingerprint_of(dir, binds_file)?,
             plain: BTreeMap::new(),
+            flags: vec![],
         })
     }
 }
@@ -337,13 +364,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn sqlc(source: &Path, target: &Path, verify: bool) -> Result<String, String> {
+fn sqlc(source: &Path, target: &Path, flags: &[String], verify: bool) -> Result<String, String> {
     let mut cmd = Command::new("cargo");
     cmd.args(["sqlc", "compose", "--source"])
         .arg(source)
         .arg("--target")
         .arg(target)
-        .arg("--skip-prepare");
+        .arg("--skip-prepare")
+        .args(flags);
     if verify {
         cmd.arg("--verify");
     }
@@ -404,19 +432,20 @@ pub(crate) fn leftover_directive(sql: &str) -> Option<&'static str> {
     .find(|d| sql.contains(d))
 }
 
-/// Composes `src` into `out`, verifies it with the same flags, and checks the templates and
-/// composed files against each other in both directions.
-fn compose_into(src: &Path, out: &Path) -> Result<(), String> {
-    let composed = sqlc(src, out, false)?;
+/// Composes `src` into `out` with `flags`, verifies it with the same flags, and checks the templates
+/// and composed files against each other in both directions. The manifest `cargo sqlc` writes
+/// beside the files is its own.
+fn compose_into(src: &Path, out: &Path, flags: &[String]) -> Result<(), String> {
+    let composed = sqlc(src, out, flags, false)?;
     debug!(output = %composed.trim(), "composed");
-    let verified = sqlc(src, out, true)?;
+    let verified = sqlc(src, out, flags, true)?;
     info!(dir = %out.display(), verify = %verified.trim().lines().last().unwrap_or(""), "composed and verified");
 
     let templates = composed_templates(src)?;
     let emitted = with_ext(out, "sql")?;
     let other: Vec<PathBuf> = files(out)?
         .into_iter()
-        .filter(|p| p.extension().is_none_or(|e| e != "sql"))
+        .filter(|p| p.extension().is_none_or(|e| e != "sql") && p != Path::new("manifest.json"))
         .collect();
     if templates != emitted || !other.is_empty() {
         return Err(format!(
@@ -492,7 +521,7 @@ pub fn compose(set: &QuestionSet, table: &str, work: &Path) -> Result<Composed, 
     fs::create_dir_all(fill.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&fill, format!("SELECT * FROM {table}\n"))
         .map_err(|e| format!("{}: {e}", fill.display()))?;
-    compose_into(&src, &out)?;
+    compose_into(&src, &out, &set.flags)?;
 
     let mut sql = BTreeMap::new();
     for q in set.questions.iter().filter(|q| q.derived_from.is_none()) {
@@ -592,6 +621,60 @@ mod tests {
         assert_eq!(names, ["counted", "rows"]);
         assert!(is_shape(&dir, "shapes/count").unwrap());
         assert!(!is_shape(&dir, "rows").unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn templates_are_composed_by_cargo_sqlc_with_the_flags_the_set_carries() {
+        let dir = scratch("compose");
+        put(
+            &dir,
+            "q/shared/sets.sqlc",
+            "SELECT set_num, year FROM lego_sets\n",
+        );
+        put(
+            &dir,
+            "q/recent.sqlc",
+            "SELECT s.set_num FROM (\n    :compose(shared/sets.sqlc)\n) s WHERE s.year > :bind(from)\n",
+        );
+        put(
+            &dir,
+            "binds.tsv",
+            "question\tname\tvalue\nrecent\tfrom\t2000\n",
+        );
+        let set = QuestionSet::load(&dir.join("q"), &dir.join("binds.tsv")).unwrap();
+        let c = compose(&set, "s", &dir.join("work")).unwrap();
+        assert!(
+            c.sql["recent"].contains("FROM lego_sets"),
+            "{}",
+            c.sql["recent"]
+        );
+        assert!(!c.sql["recent"].contains("WITH"), "{}", c.sql["recent"]);
+
+        let with = QuestionSet::load(&dir.join("q"), &dir.join("binds.tsv"))
+            .unwrap()
+            .composed_with(true, true)
+            .unwrap();
+        assert_ne!(with.hash, set.hash);
+        let c = compose(&with, "s", &dir.join("work")).unwrap();
+        assert!(
+            c.sql["recent"].starts_with("WITH shared_sets AS ("),
+            "{}",
+            c.sql["recent"]
+        );
+        let manifest = fs::read_to_string(dir.join("work/sql/manifest.json")).unwrap();
+        assert!(manifest.contains("\"with\": true") && manifest.contains("\"respell\": true"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plain_questions_take_no_composing_flags() {
+        let dir = scratch("plain-flags");
+        put(&dir, "q/a.sql", "SELECT 1\n");
+        put(&dir, "binds.tsv", "question\tname\tvalue\n");
+        let set = QuestionSet::load(&dir.join("q"), &dir.join("binds.tsv")).unwrap();
+        let e = set.composed_with(true, false).err().unwrap_or_default();
+        assert!(e.contains("--with"), "{e}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
