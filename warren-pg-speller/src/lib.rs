@@ -18,9 +18,9 @@
 //! beside it laterally, or calls a volatile function is left as written, and so is every statement
 //! where a condition fails. A spelling is built from the statement as it was parsed, never from its
 //! text. It reads no table the statement does not read, and reads each as the statement does: as the
-//! owner of the view it lies in or as the user running it, under the same row security. The indexes
-//! a table carries play no part. A plan made from a spelling is made again when an index on a table
-//! it reads changes.
+//! owner of the view it lies in or as the user running it, under the same row security. Apart from
+//! its unique keys, the indexes a table carries play no part. A plan made from a spelling is made
+//! again when an index on a table it reads changes.
 //!
 //! A spelling is built and planned inside an internal subtransaction, begun only once one is being
 //! built; where either raises an ERROR other than a cancel, the statement is planned as written.
