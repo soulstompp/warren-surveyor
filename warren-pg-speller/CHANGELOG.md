@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- Once a join is taken out of a UNION ALL's arms, every WITH query the statement can read counts its
+  readers again, wherever they are. A WITH query each arm read through a subquery, as
+  `cargo sqlc compose --with` writes one, is read in its reader's place once one reader is left, and
+  the grouping over it is taken on each side as it is where each arm holds the query's body.
+- PostgreSQL 14, 15, 16 and 17 as well as 18, each a Cargo feature, `pg14` to `pg18`; `pg18` is the
+  default.
+
 ## 0.1.1
 
 - Kept in the warren-surveyor repository, beside the surveyor that installs it.

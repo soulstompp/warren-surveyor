@@ -1305,6 +1305,36 @@ mod tests {
     }
 
     #[pg_test]
+    fn an_install_of_0_1_0_updates_to_this_version_and_keeps_its_objects() {
+        let objects =
+            "SELECT count(*)::text FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid \
+                       WHERE e.extname = 'warren_surveyor_pg' AND d.deptype = 'e'";
+        let made = texts(objects);
+        // the objects 0.1.0 made on PostgreSQL 18 are the ones this version makes there
+        Spi::run(
+            "UPDATE pg_extension SET extversion = '0.1.0' WHERE extname = 'warren_surveyor_pg'",
+        )
+        .unwrap();
+        assert_eq!(
+            texts(
+                "SELECT path FROM pg_extension_update_paths('warren_surveyor_pg') \
+                 WHERE source = '0.1.0' AND target = '0.1.1'"
+            ),
+            vec!["0.1.0--0.1.1"]
+        );
+        Spi::run("ALTER EXTENSION warren_surveyor_pg UPDATE").unwrap();
+        assert_eq!(
+            texts("SELECT extversion FROM pg_extension WHERE extname = 'warren_surveyor_pg'"),
+            vec![env!("CARGO_PKG_VERSION")]
+        );
+        assert_eq!(texts(objects), made);
+        assert_eq!(
+            texts("SELECT count(*)::text FROM pg_am WHERE amname = 'surveyor'"),
+            vec!["1"]
+        );
+    }
+
+    #[pg_test]
     fn every_operator_class_validates() {
         assert_eq!(
             Spi::get_one::<bool>(

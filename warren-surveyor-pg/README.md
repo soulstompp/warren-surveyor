@@ -2,9 +2,9 @@
 
 *It measures without digging.*
 
-The surveyor is an index for PostgreSQL 18 that is never scanned and holds nothing. You put one on
-a table, on the table's own unique key. While a statement is planned, it reads the indexes you
-already have, your B-trees and the GIN and GiST indexes that search words, trigrams, boxes and
+The surveyor is an index for PostgreSQL 14 to 18 that is never scanned and holds nothing. You put
+one on a table, on the table's own unique key. While a statement is planned, it reads the indexes
+you already have, your B-trees and the GIN and GiST indexes that search words, trigrams, boxes and
 distances, from the top, stopping above the leaf pages wherever it can. Then it hands the planner
 what it finds:
 
@@ -48,7 +48,7 @@ that the server has them:
 SELECT name, default_version FROM pg_available_extensions WHERE name = 'warren_surveyor_pg';
 ```
 
-It gives `0.1.0`. Installing changes no database and no setting: the library acts only in a session
+It gives `0.1.1`. Installing changes no database and no setting: the library acts only in a session
 that loads it, and the access method exists only in a database that creates the extension.
 *Uninstalling*, under *Reference*, takes it back out.
 
@@ -408,8 +408,8 @@ applies fails the statement.
 
 ## Checking it
 
-Run the statement under `EXPLAIN (ANALYZE, BUFFERS)` (PostgreSQL 18 turns `BUFFERS` on with
-`ANALYZE`; writing it keeps the habit), with the surveyor and without, and read in this order:
+Run the statement under `EXPLAIN (ANALYZE, BUFFERS)` (`BUFFERS` comes with `ANALYZE` from PostgreSQL
+18, and is written out before it), with the surveyor and without, and read in this order:
 
 1. **The disk.** Each scan's `Buffers:` line: `shared read` is pages from outside shared buffers.
    A node's buffers include its children's, so read each scan's own.
@@ -486,16 +486,18 @@ question by question, pages first.
 
 ### Requirements
 
-PostgreSQL 18, Rust 1.96 or later and cargo-pgrx 0.19.2. On a server installed by a package manager,
-also its development package and libclang, which pgrx builds against; there `cargo pgrx install`
-takes `--sudo`, since the server's directories are the system's. It builds against
-`warren-pg-speller`, beside it in this repository. pgrx reads where your PostgreSQL is from
-`~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`); the second line below writes that file, and
-where it exists already, add the `pg18` line under its `[configs]` instead:
+PostgreSQL 14 to 18 (14.19, 15.14, 16.10, 17.6 or later), Rust 1.96 or later and cargo-pgrx 0.19.2.
+On 14 and 15, building a surveyor warns that an UPDATE changing one of its columns is no longer HOT.
+On a server installed by a package manager, also its development package and libclang, which pgrx
+builds against; there `cargo pgrx install` takes `--sudo`, since the server's directories are the
+system's. It builds against `warren-pg-speller`, beside it in this repository. pgrx reads where your
+PostgreSQL is from `~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`); the last line below writes
+that file, and where it exists already, add that `pg` line under its `[configs]` instead:
 
 ```sh
 PG_CONFIG=/path/to/pg_config
-mkdir -p ~/.pgrx && printf '[configs]\npg18 = "%s"\n' "$PG_CONFIG" > ~/.pgrx/config.toml
+PG_MAJOR=$("$PG_CONFIG" --version | awk '{print $2}' | cut -d. -f1)
+mkdir -p ~/.pgrx && printf '[configs]\npg%s = "%s"\n' "$PG_MAJOR" "$PG_CONFIG" > ~/.pgrx/config.toml
 ```
 
 `CREATE EXTENSION warren_surveyor_pg` takes a superuser: the extension is not trusted.
@@ -637,8 +639,8 @@ It creates no table, view or function for users to call.
 
 ### Upgrading
 
-This is version 0.1.0, the first, with no script for `ALTER EXTENSION … UPDATE`. A surveyor holds
-no page, so nothing on disk moves between versions. A new library goes in with
+This is version 0.1.1; `ALTER EXTENSION warren_surveyor_pg UPDATE` takes a 0.1.0 install to it.
+A surveyor holds no page, so nothing on disk moves between versions. A new library goes in with
 `cargo pgrx install`; a session loads it once, so reconnect (and restart, where it is in
 `shared_preload_libraries`). Where a release changes the extension's SQL, turn the surveyor off,
 drop and create the extension, and turn it on: nothing in that reads a table but `ANALYZE`. A

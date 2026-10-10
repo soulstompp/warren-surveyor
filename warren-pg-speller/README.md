@@ -243,6 +243,7 @@ pgrx = "=0.19.2"
 warren-pg-speller = { version = "0.1", default-features = false }
 
 [features]
+pg16 = ["pgrx/pg16", "warren-pg-speller/pg16"]
 pg18 = ["pgrx/pg18", "warren-pg-speller/pg18"]
 ```
 
@@ -260,8 +261,9 @@ extension's library before the statement is planned: `shared_preload_libraries` 
 every session, `session_preload_libraries` for the new sessions of the database or role it is set
 on, and `LOAD` for one session.
 
-It needs PostgreSQL 18 and pgrx 0.19.2. The `pg18` feature is the default; `pg19` builds the hook
-for PostgreSQL 19's planner signature, as pgrx 0.19.2 binds its beta 2, and is not yet tested.
+It needs PostgreSQL 14 to 18 and pgrx 0.19.2, a feature for each, `pg14` to `pg18`. The `pg18`
+feature is the default; `pg19` builds the hook for PostgreSQL 19's planner signature, as pgrx 0.19.2
+binds its beta 2, and is not yet tested.
 
 ## The queries it reads
 

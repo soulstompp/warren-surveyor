@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [package]
 name = "warren-surveyor-pg"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Kenneth Allen Flegal"]
@@ -28,7 +28,7 @@ pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 pgrx = "=0.19.2"
-warren-pg-speller = { path = "../warren-pg-speller", version = "0.1.1", default-features = false }
+warren-pg-speller = { path = "../warren-pg-speller", version = "0.1.2", default-features = false }
 
 [dependencies.pgrx-bench]
 version = "=0.19.2"
