@@ -1,0 +1,14 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# December 2020 purchases by builders living within 15 km of central London, per day, and the
+# bricks they brought.
+-- December 2020 purchases by builders within 15 km of central London, per day, with their bricks
+SELECT inv.day, count(DISTINCT inv.purchase_id) AS purchases,
+       sum(ip.quantity * inv.copies)::integer AS bricks
+FROM (
+    :compose(shared/bricks.sqlc, @bought = bought/london_15km_december_2020.sqlc)
+) inv
+JOIN lego_inventory_parts ip ON ip.inventory_id = inv.inventory_id
+GROUP BY 1
+ORDER BY 1;

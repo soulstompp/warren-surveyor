@@ -1,0 +1,15 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# The purchases of the Decembers of 2016 to 2020, each with the home zone of the city its builder
+# lives in and the set it bought: one row per purchase, keyed by purchase_id.
+-- the purchases of five Decembers
+SELECT p.purchase_id, ci.zone AS home_zone, c.set_num
+FROM lego_purchases p
+JOIN lego_collection c ON c.builder_id = p.builder_id AND c.row_no = p.row_no
+JOIN lego_builders b   ON b.builder_id = p.builder_id
+JOIN lego_streets st   ON st.street_id = b.street_id
+JOIN lego_postcodes pc ON pc.postcode_id = st.postcode_id
+JOIN lego_cities ci    ON ci.city_id = pc.city_id
+WHERE extract(month FROM lego.clock(p.ordered_at))::smallint = 12
+  AND lego.clock(p.ordered_at) >= '2016-12-01' AND lego.clock(p.ordered_at) < '2021-01-01'

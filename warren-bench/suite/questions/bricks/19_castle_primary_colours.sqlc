@@ -1,0 +1,15 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# How many of Castle's sets use each primary colour, and how many bricks of it they hold.
+-- How many of Castle's sets use each primary colour, and the bricks of it they hold
+SELECT co.id, co.name AS colour, count(DISTINCT inv.set_num) AS sets,
+       sum(ip.quantity * inv.copies)::integer AS bricks
+FROM (
+    :compose(shared/bricks.sqlc, @bought = bought/castle_sets.sqlc)
+) inv
+JOIN lego_inventory_parts ip ON ip.inventory_id = inv.inventory_id
+JOIN lego_colors co          ON co.id = ip.color_id
+WHERE lego_oo.colour_wheel(co.rgb) IN (0, 4, 8)
+GROUP BY co.id, co.name
+ORDER BY sets DESC, co.id;

@@ -1,0 +1,11 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Castle and every theme below it: one row per theme, keyed by id.
+-- the Castle subtree
+WITH RECURSIVE castle (id) AS (
+    SELECT t.id FROM lego_themes t WHERE t.id = 186
+  UNION ALL
+    SELECT t.id FROM lego_themes t JOIN castle c ON t.parent_id = c.id
+)
+SELECT id FROM castle

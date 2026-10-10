@@ -1,0 +1,14 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Purchases of the Star Wars class's sets in the Decembers of 2016 to 2020, per year, and the
+# bricks they brought.
+-- Purchases of the Star Wars class's sets in the Decembers of 2016 to 2020, per year, with their bricks
+SELECT inv.year, count(DISTINCT inv.purchase_id) AS purchases,
+       sum(ip.quantity * inv.copies)::integer AS bricks
+FROM (
+    :compose(shared/bricks.sqlc, @bought = bought/star_wars_decembers.sqlc)
+) inv
+JOIN lego_inventory_parts ip ON ip.inventory_id = inv.inventory_id
+GROUP BY 1
+ORDER BY 1;
