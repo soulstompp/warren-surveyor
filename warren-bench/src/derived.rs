@@ -219,6 +219,7 @@ mod tests {
             hash: "h".into(),
             plain: Default::default(),
             flags: vec![],
+            search: vec![],
         }
     }
 

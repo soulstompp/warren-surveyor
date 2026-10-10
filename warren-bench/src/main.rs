@@ -185,6 +185,11 @@ struct Common {
     /// Compose the templates with `cargo sqlc compose --respell`.
     #[arg(long)]
     respell: bool,
+    /// Another directory the templates compose relations from, after their own, as
+    /// `cargo sqlc compose --search-path` reads it; its templates are no questions. Repeat it to
+    /// search more than one.
+    #[arg(long = "search-path", value_name = "DIR")]
+    search_path: Vec<PathBuf>,
     /// Where each target's questions are composed. By default `compose` in the bench's cache
     /// directory, `$XDG_CACHE_HOME/warren-bench`, else `~/.cache/warren-bench`.
     #[arg(long)]
@@ -316,12 +321,14 @@ impl Common {
     /// The questions: those given, else the kit's, read from the bench's cache directory.
     fn question_set(&self) -> Result<QuestionSet, String> {
         if let (Some(q), Some(b)) = (&self.questions, &self.binds) {
-            return QuestionSet::load(q, b)?.composed_with(self.with, self.respell);
+            return QuestionSet::load_searching(q, b, &self.search_path)?
+                .composed_with(self.with, self.respell);
         }
         let kit = kit::cached(&kit::cache_root()?)?;
-        QuestionSet::load(
+        QuestionSet::load_searching(
             self.questions.as_ref().unwrap_or(&kit.join(kit::QUESTIONS)),
             self.binds.as_ref().unwrap_or(&kit.join(kit::BINDS)),
+            &self.search_path,
         )?
         .composed_with(self.with, self.respell)
     }
@@ -595,6 +602,7 @@ async fn sample_cmd(a: SampleArgs) -> Result<u8, String> {
         binds: Some(s.binds.clone()),
         with: false,
         respell: false,
+        search_path: vec![],
         work: a.work,
         statement_timeout: s.statement_timeout.clone(),
         rss_cap_mb: a.rss_cap_mb,

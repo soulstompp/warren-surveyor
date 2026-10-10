@@ -188,6 +188,7 @@ mod tests {
             hash: "h".into(),
             plain: Default::default(),
             flags: vec![],
+            search: vec![],
         };
         restrict(&mut set, &["lines/".into(), "parts/".into()]).unwrap();
         assert_eq!(set.questions.len(), 2);
