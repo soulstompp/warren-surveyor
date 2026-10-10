@@ -274,6 +274,19 @@ unsafe extern "C-unwind" fn cost(
     *pages = 0.0;
 }
 
+/// A warren key's collation, as SQL names it and as `pg_collation` lists it, and another collation
+/// that compares the same.
+#[cfg(all(
+    any(test, feature = "pg_test"),
+    not(any(feature = "pg14", feature = "pg15", feature = "pg16"))
+))]
+const KEY_COLLATION: [&str; 3] = ["pg_c_utf8", "pg_c_utf8", "\"C\""];
+#[cfg(all(
+    any(test, feature = "pg_test"),
+    any(feature = "pg14", feature = "pg15", feature = "pg16")
+))]
+const KEY_COLLATION: [&str; 3] = ["\"C\"", "C", "\"POSIX\""];
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -1041,6 +1054,17 @@ mod tests {
         .expect("the tree could not be made");
     }
 
+    /// A condition each step of `sub` checks by reading `table` again: from PostgreSQL 18 a semi join
+    /// that hashes the step and reads the table past it; before 18, which hashes the table once for
+    /// the whole walk, an EXISTS kept as a subplan, which reads the table for each row.
+    fn read_again(table: &str) -> String {
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        let kept = "";
+        #[cfg(not(any(feature = "pg18", feature = "pg19")))]
+        let kept = " OFFSET 0";
+        format!("EXISTS (SELECT FROM {table} WHERE {table}.id = sub.id % 7 + 1{kept})")
+    }
+
     /// Theme 3 and the themes under it, counted, read from `table`.
     fn subtree(table: &str) -> String {
         format!(
@@ -1135,11 +1159,14 @@ mod tests {
     fn a_recursive_query_whose_read_passes_its_tables_pages_or_fails_keeps_the_planners_estimate() {
         tree();
         // each step reads the tree again
-        let past = "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
-                    WHERE sub.id < 10000 AND EXISTS (SELECT FROM tree WHERE tree.id = sub.id % 7 + 1)) \
-                    SELECT count(*)::text FROM sub";
-        assert_eq!(texts(past), vec!["10000"]);
-        assert_ne!(estimated(past, "CTE Scan on sub"), 10000.0);
+        let past = format!(
+            "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
+             WHERE sub.id < 10000 AND {}) \
+             SELECT count(*)::text FROM sub",
+            read_again("tree")
+        );
+        assert_eq!(texts(&past), vec!["10000"]);
+        assert_ne!(estimated(&past, "CTE Scan on sub"), 10000.0);
         // the read raises an error, and the statement is planned all the same
         let failing = "WITH RECURSIVE sub(id) AS (SELECT 3 UNION ALL \
                        SELECT t.id / (t.id - t.id) FROM tree t JOIN sub ON t.parent_id = sub.id) \
@@ -1267,11 +1294,14 @@ mod tests {
         .collect::<Vec<_>>();
         assert!(read.is_empty(), "{read:#?}");
         // each step reads the tree again, past the pages of the tree and the sets
-        let past = "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
-                    WHERE sub.id < 10000 AND EXISTS (SELECT FROM twig WHERE twig.id = sub.id % 7 + 1)) \
-                    SELECT count(*)::text FROM sub JOIN twig_sets s ON s.id = sub.id";
-        assert_eq!(texts(past), vec!["10000"]);
-        assert_ne!(estimated(past, "CTE Scan on sub"), 10000.0);
+        let past = format!(
+            "WITH RECURSIVE sub(id) AS (SELECT 1 UNION ALL SELECT sub.id + 1 FROM sub \
+             WHERE sub.id < 10000 AND {}) \
+             SELECT count(*)::text FROM sub JOIN twig_sets s ON s.id = sub.id",
+            read_again("twig")
+        );
+        assert_eq!(texts(&past), vec!["10000"]);
+        assert_ne!(estimated(&past, "CTE Scan on sub"), 10000.0);
     }
 
     #[pg_test]
@@ -1308,11 +1338,12 @@ mod tests {
     #[pg_test]
     fn a_warren_key_compares_by_code_point() {
         assert_eq!(
-            Spi::get_one::<bool>(
+            Spi::get_one::<bool>(&format!(
                 "SELECT '9'::warren_key < 'B'::warren_key AND 'B'::warren_key < 'a'::warren_key \
-                 AND (SELECT collname = 'pg_c_utf8' FROM pg_collation c JOIN pg_type t ON t.typcollation = c.oid \
-                      WHERE t.typname = 'warren_key')"
-            ),
+                 AND (SELECT collname = '{}' FROM pg_collation c JOIN pg_type t ON t.typcollation = c.oid \
+                      WHERE t.typname = 'warren_key')",
+                super::KEY_COLLATION[1]
+            )),
             Ok(Some(true))
         );
     }
@@ -1376,6 +1407,8 @@ mod sessions {
         assert_eq!(first.matches("CTE Scan on side_a").count(), 2, "{first}");
     }
 
+    // PostgreSQL 14 has no pg_walinspect to read the WAL with
+    #[cfg(not(feature = "pg14"))]
     #[test]
     fn new_rows_write_nothing_to_the_wal_for_a_surveyor() {
         let mut db = session();
@@ -1394,14 +1427,19 @@ mod sessions {
             "INSERT INTO logged_rows SELECT g, g % 100 FROM generate_series(1, 5000) g",
         )
         .unwrap();
-        let row = db
-            .query_one(
-                "SELECT count(*) FILTER (WHERE relfilenode = pg_relation_filenode('logged_rows_a')), \
-                        count(*) FILTER (WHERE relfilenode = pg_relation_filenode('logged_rows')) \
-                 FROM pg_get_wal_block_info($1::text::pg_lsn, pg_current_wal_flush_lsn(), false)",
-                &[&start],
-            )
-            .unwrap();
+        // the blocks of the surveyor and of the table the WAL holds since the start
+        #[cfg(not(feature = "pg15"))]
+        let blocks = "SELECT count(*) FILTER (WHERE relfilenode = pg_relation_filenode('logged_rows_a')), \
+                             count(*) FILTER (WHERE relfilenode = pg_relation_filenode('logged_rows')) \
+                      FROM pg_get_wal_block_info($1::text::pg_lsn, pg_current_wal_flush_lsn(), false)";
+        // the records of the WAL since the start that name a block of the surveyor, and of the table
+        #[cfg(feature = "pg15")]
+        let blocks = "SELECT count(*) FILTER (WHERE block_ref ~ ('rel [0-9]+/[0-9]+/' \
+                                 || pg_relation_filenode('logged_rows_a')::text || ' fork')), \
+                             count(*) FILTER (WHERE block_ref ~ ('rel [0-9]+/[0-9]+/' \
+                                 || pg_relation_filenode('logged_rows')::text || ' fork')) \
+                      FROM pg_get_wal_records_info($1::text::pg_lsn, pg_current_wal_flush_lsn())";
+        let row = db.query_one(blocks, &[&start]).unwrap();
         // the table's own blocks are there to be seen
         assert!(row.get::<_, i64>(1) > 0, "no block of the table");
         assert_eq!(row.get::<_, i64>(0), 0, "blocks of the surveyor");
@@ -1605,29 +1643,36 @@ mod sessions {
             )
             .unwrap();
         let mut installed = Vec::new();
+        let [key, _, other] = super::KEY_COLLATION;
         for (made, by) in [
             // by a role that may create in the schema, and may add a CHECK to it later
             (
-                "CREATE DOMAIN warren_key AS text COLLATE pg_c_utf8",
+                format!("CREATE DOMAIN warren_key AS text COLLATE {key}"),
                 "a user",
             ),
             (
-                "SET ROLE warren_key_maker; CREATE DOMAIN warren_key AS text COLLATE pg_c_utf8; \
-                 RESET ROLE; ALTER EXTENSION pg_prewarm ADD DOMAIN warren_key",
+                format!(
+                    "SET ROLE warren_key_maker; CREATE DOMAIN warren_key AS text COLLATE {key}; \
+                     RESET ROLE; ALTER EXTENSION pg_prewarm ADD DOMAIN warren_key"
+                ),
                 "an extension, owned by a user",
             ),
             (
-                "CREATE DOMAIN warren_key AS text COLLATE \"C\"; \
-                 ALTER EXTENSION pg_prewarm ADD DOMAIN warren_key",
+                format!(
+                    "CREATE DOMAIN warren_key AS text COLLATE {other}; \
+                     ALTER EXTENSION pg_prewarm ADD DOMAIN warren_key"
+                ),
                 "an extension, of another collation",
             ),
             (
-                "CREATE DOMAIN warren_key AS text COLLATE pg_c_utf8; \
-                 ALTER EXTENSION pg_prewarm ADD DOMAIN warren_key",
+                format!(
+                    "CREATE DOMAIN warren_key AS text COLLATE {key}; \
+                     ALTER EXTENSION pg_prewarm ADD DOMAIN warren_key"
+                ),
                 "an extension, as its own",
             ),
         ] {
-            taken.batch_execute(made).unwrap();
+            taken.batch_execute(&made).unwrap();
             let install = taken.batch_execute("CREATE EXTENSION warren_surveyor_pg");
             installed.push((
                 by,
@@ -1647,8 +1692,10 @@ mod sessions {
         drop(taken);
         db.batch_execute("DROP DATABASE warren_key_taken").unwrap();
         db.batch_execute("DROP ROLE warren_key_maker").unwrap();
-        let refused = "type public.warren_key exists, and is not a domain over text with \
-                       collation pg_c_utf8 that an extension made and a superuser owns";
+        let refused = format!(
+            "type public.warren_key exists, and is not a domain over text with \
+             collation {key} that an extension made and a superuser owns"
+        );
         assert_eq!(
             installed,
             [

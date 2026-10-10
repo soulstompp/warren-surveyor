@@ -924,7 +924,8 @@ pub(crate) mod tests {
     fn leaves(index: &str) -> u32 {
         Spi::run("CREATE EXTENSION IF NOT EXISTS pageinspect").unwrap();
         Spi::get_one::<i64>(&format!(
-            "SELECT count(*) FROM bt_multi_page_stats('{index}', 1, -1) WHERE type = 'l'"
+            "SELECT count(*) FROM {} s WHERE s.type = 'l'",
+            crate::compat::page_stats(index)
         ))
         .unwrap()
         .unwrap() as u32

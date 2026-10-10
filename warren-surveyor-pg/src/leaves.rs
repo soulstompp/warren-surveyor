@@ -2081,13 +2081,14 @@ mod tests {
             estimated(query, ""),
             number("SELECT count(*) FROM listed WHERE cat = 7")
         );
-        let leaves = number(
+        let leaves = number(&format!(
             "SELECT count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('listed_cat_id', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('listed_cat_id', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '07 00 00 00%' \
                AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
-        );
+            crate::compat::page_stats("listed_cat_id")
+        ));
         assert!(leaves >= 6.0, "{leaves} leaves");
         let read = crate::conditions::tests::reads(query);
         let pages = read

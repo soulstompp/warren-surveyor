@@ -1836,13 +1836,14 @@ mod tests {
             m.rows
         );
         // the leaves the block lies on
-        let leaves = count(
+        let leaves = count(&format!(
             "SELECT count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('striped_an', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('striped_an', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '02 00 00 00%' \
                AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
-        );
+            crate::compat::page_stats("striped_an")
+        ));
         assert!(
             (m.leaves - leaves).abs() <= 1.0,
             "{} leaves measured, {leaves} counted, {m:?}",
@@ -2464,9 +2465,12 @@ mod sessions {
             .unwrap();
             let dead: i64 = db
                 .query_one(
-                    "SELECT count(*) FROM bt_multi_page_stats('drained_k', 1, -1) s, \
-                         LATERAL bt_page_items('drained_k', s.blkno::int) i \
-                     WHERE s.type = 'l' AND i.dead",
+                    &format!(
+                        "SELECT count(*) FROM {} s, \
+                             LATERAL bt_page_items('drained_k', s.blkno::int) i \
+                         WHERE s.type = 'l' AND i.dead",
+                        crate::compat::page_stats("drained_k")
+                    ),
                     &[],
                 )
                 .unwrap()

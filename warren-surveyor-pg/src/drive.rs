@@ -500,7 +500,11 @@ pub(crate) mod tests {
             next(root, stage, input_rel, output_rel, extra);
         }
         for p in cells((*output_rel).pathlist) {
-            let path = p as *mut pg_sys::Path;
+            let mut path = p as *mut pg_sys::Path;
+            // a path under a projection is read through it
+            if (*path).type_ == pg_sys::NodeTag::T_ProjectionPath {
+                path = (*(path as *mut pg_sys::ProjectionPath)).subpath;
+            }
             let (kind, under) = match (*path).type_ {
                 pg_sys::NodeTag::T_SortPath => (
                     "sort".to_string(),

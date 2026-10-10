@@ -268,6 +268,18 @@ pub(crate) fn forget() {
     ORDER.with(|o| o.borrow_mut().clear());
 }
 
+/// Whether the pages of the file `file` in tablespace `space` are counted as out of shared buffers,
+/// whatever the buffers hold.
+#[cfg(not(any(test, feature = "pg_test")))]
+fn evicted(_space: pg_sys::Oid, _file: compat::RelFileNumber) -> bool {
+    false
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+fn evicted(space: pg_sys::Oid, file: compat::RelFileNumber) -> bool {
+    tests::EVICTED.with(|e| e.borrow().contains(&(space, file)))
+}
+
 /// The pages of each relation of this database whose main fork's pages are held in shared buffers
 /// now: one pass over the buffers' headers, each header locked while its tag is read, as
 /// `pg_buffercache` reads them, and no page read.
@@ -283,6 +295,7 @@ unsafe fn count_resident() -> Resident {
         if state & valid == valid
             && tag.forkNum == pg_sys::ForkNumber::MAIN_FORKNUM
             && database == pg_sys::MyDatabaseId
+            && !evicted(space, file)
         {
             *counts.entry((space, file)).or_insert(0.0) += 1.0;
         }
@@ -573,22 +586,165 @@ unsafe fn page_price(
     (price / per, fetched, resident, order)
 }
 
-/// The price of `path` under `rules`.
-pub(crate) unsafe fn estimate(
-    root: *mut pg_sys::PlannerInfo,
-    path: *mut pg_sys::IndexPath,
-    loop_count: f64,
-    rules: Rules,
-) -> Estimate {
-    let index = (*path).indexinfo;
-    let rel = (*index).rel;
-    let keys = (*index).nkeycolumns;
-    let (measured, leaves) = match rules.measured.then(|| measured_share(root, path)).flatten() {
-        Some((share, leaves)) => (Some(share), leaves),
-        None => (None, None),
-    };
+/// What a condition of a path's scan compares by: its operator, where it has one, whether it
+/// compares a row, the elements of its array, where it is one, and whether it is an IS NULL.
+struct Condition {
+    operator: pg_sys::Oid,
+    row_compare: bool,
+    array: Option<f64>,
+    is_null: bool,
+}
 
-    // the conditions that bound the scan, and the scans its arrays make
+unsafe fn condition(root: *mut pg_sys::PlannerInfo, node: *mut pg_sys::Node) -> Condition {
+    let mut c = Condition {
+        operator: pg_sys::InvalidOid,
+        row_compare: false,
+        array: None,
+        is_null: false,
+    };
+    match tag(node) {
+        pg_sys::NodeTag::T_OpExpr => {
+            c.operator = (*(node as *mut pg_sys::OpExpr)).opno;
+        }
+        pg_sys::NodeTag::T_RowCompareExpr => {
+            let opnos = (*(node as *mut pg_sys::RowCompareExpr)).opnos;
+            c.operator = (*(*opnos).elements).oid_value;
+            c.row_compare = true;
+        }
+        pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+            let saop = node as *mut pg_sys::ScalarArrayOpExpr;
+            let array = cells((*saop).args)[1] as *mut pg_sys::Node;
+            c.operator = (*saop).opno;
+            c.array = Some(compat::estimate_array_length(root, array));
+        }
+        pg_sys::NodeTag::T_NullTest => {
+            let test = node as *mut pg_sys::NullTest;
+            c.is_null = (*test).nulltesttype == pg_sys::NullTestType::IS_NULL;
+        }
+        other => error!("unsupported indexqual type: {:?}", other),
+    }
+    c
+}
+
+/// The scans the arrays among `quals` make.
+unsafe fn array_scans(root: *mut pg_sys::PlannerInfo, quals: *mut pg_sys::List) -> f64 {
+    let mut scans = 1.0;
+    for qual in cells(quals) {
+        let node = (*(qual as *mut pg_sys::RestrictInfo)).clause as *mut pg_sys::Node;
+        if tag(node) == pg_sys::NodeTag::T_ScalarArrayOpExpr {
+            let saop = node as *mut pg_sys::ScalarArrayOpExpr;
+            let length =
+                compat::estimate_array_length(root, cells((*saop).args)[1] as *mut pg_sys::Node);
+            if length > 1.0 {
+                scans *= length;
+            }
+        }
+    }
+    scans
+}
+
+/// The conditions that bound a path's scan, and what reading them found.
+struct Bounds {
+    bound: *mut pg_sys::List,
+    /// The last key column they reach, and whether it has an equality.
+    column: i32,
+    equal_here: bool,
+    /// Whether an array, or an IS NULL, is among them.
+    found_array: bool,
+    found_is_null: bool,
+    /// The order of the table against the index's first column, where it was read on the way.
+    correlation: Option<f64>,
+    /// The scans their arrays make.
+    sa_scans: f64,
+    /// Whether arrays over columns no condition fixes were added to the scans.
+    skipped: bool,
+    /// Whether every condition of the path bounds the scan.
+    bounded: bool,
+}
+
+#[cfg(feature = "pg17")]
+compile_error!(
+    "the B-tree price, and the eviction its tests make, are not written for PostgreSQL 17"
+);
+
+/// The conditions that bound `path`'s scan through `index`: each column's, up to the first column
+/// without an equality and the column after it; a column with no condition at all ends them.
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+unsafe fn bounds(
+    root: *mut pg_sys::PlannerInfo,
+    index: *mut pg_sys::IndexOptInfo,
+    path: *mut pg_sys::IndexPath,
+) -> Bounds {
+    let mut bound: *mut pg_sys::List = null_mut();
+    let mut column: i32 = 0;
+    let mut equal_here = false;
+    let mut found_array = false;
+    let mut found_is_null = false;
+    let mut sa_scans = 1.0;
+    let mut bounded = true;
+    for clause in cells((*path).indexclauses) {
+        let iclause = clause as *mut pg_sys::IndexClause;
+        let at = (*iclause).indexcol as i32;
+        if column != at {
+            if !equal_here {
+                bounded = false;
+                break;
+            }
+            equal_here = false;
+            column += 1;
+            if column != at {
+                bounded = false;
+                break;
+            }
+        }
+        for qual in cells((*iclause).indexquals) {
+            let rinfo = qual as *mut pg_sys::RestrictInfo;
+            let c = condition(root, (*rinfo).clause as *mut pg_sys::Node);
+            if let Some(length) = c.array {
+                found_array = true;
+                if length > 1.0 {
+                    sa_scans *= length;
+                }
+            }
+            if c.is_null {
+                found_is_null = true;
+                equal_here = true;
+            }
+            if c.operator != pg_sys::InvalidOid {
+                let strategy = pg_sys::get_op_opfamily_strategy(
+                    c.operator,
+                    *(*index).opfamily.add(column as usize),
+                );
+                if strategy == pg_sys::BTEqualStrategyNumber as i32 {
+                    equal_here = true;
+                }
+            }
+            bound = pg_sys::lappend(bound, rinfo as *mut c_void);
+        }
+    }
+    Bounds {
+        bound,
+        column,
+        equal_here,
+        found_array,
+        found_is_null,
+        correlation: None,
+        sa_scans,
+        skipped: false,
+        bounded,
+    }
+}
+
+/// The conditions that bound `path`'s scan through `index`: each column's, a column no condition
+/// fixes stepped through by an array of its values where that takes fewer scans than the index
+/// has pages, up to the first column without an equality and the column after it.
+#[cfg(any(feature = "pg18", feature = "pg19"))]
+unsafe fn bounds(
+    root: *mut pg_sys::PlannerInfo,
+    index: *mut pg_sys::IndexOptInfo,
+    path: *mut pg_sys::IndexPath,
+) -> Bounds {
+    let keys = (*index).nkeycolumns;
     let mut bound: *mut pg_sys::List = null_mut();
     let mut skip_quals: *mut pg_sys::List = null_mut();
     let mut column: i32 = 0;
@@ -596,11 +752,9 @@ pub(crate) unsafe fn estimate(
     let mut found_row_compare = false;
     let mut found_array = false;
     let mut found_is_null = false;
-    let mut have_correlation = false;
-    let mut correlation = 0.0;
+    let mut correlation = None;
     let mut sa_scans = 1.0;
     let mut skipped = false;
-    // whether every condition of the path bounds the scan
     let mut bounded = true;
     'clauses: for clause in cells((*path).indexclauses) {
         let iclause = clause as *mut pg_sys::IndexClause;
@@ -623,10 +777,11 @@ pub(crate) unsafe fn estimate(
                 let mut is_default = true;
                 let mut distinct = pg_sys::get_variable_numdistinct(&mut vardata, &mut is_default);
                 if column == 0 {
-                    if !vardata.statsTuple.is_null() {
-                        correlation = first_column_correlation(index, &vardata);
-                    }
-                    have_correlation = true;
+                    correlation = Some(if vardata.statsTuple.is_null() {
+                        0.0
+                    } else {
+                        first_column_correlation(index, &vardata)
+                    });
                 }
                 release(&mut vardata);
                 if is_default {
@@ -662,39 +817,23 @@ pub(crate) unsafe fn estimate(
         }
         for qual in cells((*iclause).indexquals) {
             let rinfo = qual as *mut pg_sys::RestrictInfo;
-            let node = (*rinfo).clause as *mut pg_sys::Node;
-            let mut operator = pg_sys::InvalidOid;
-            match tag(node) {
-                pg_sys::NodeTag::T_OpExpr => {
-                    operator = (*(node as *mut pg_sys::OpExpr)).opno;
-                }
-                pg_sys::NodeTag::T_RowCompareExpr => {
-                    let opnos = (*(node as *mut pg_sys::RowCompareExpr)).opnos;
-                    operator = (*(*opnos).elements).oid_value;
-                    found_row_compare = true;
-                }
-                pg_sys::NodeTag::T_ScalarArrayOpExpr => {
-                    let saop = node as *mut pg_sys::ScalarArrayOpExpr;
-                    let array = cells((*saop).args)[1] as *mut pg_sys::Node;
-                    let length = compat::estimate_array_length(root, array);
-                    operator = (*saop).opno;
-                    found_array = true;
-                    if length > 1.0 {
-                        sa_scans *= length;
-                    }
-                }
-                pg_sys::NodeTag::T_NullTest => {
-                    let test = node as *mut pg_sys::NullTest;
-                    if (*test).nulltesttype == pg_sys::NullTestType::IS_NULL {
-                        found_is_null = true;
-                        equal_here = true;
-                    }
-                }
-                other => error!("unsupported indexqual type: {:?}", other),
+            let c = condition(root, (*rinfo).clause as *mut pg_sys::Node);
+            if c.row_compare {
+                found_row_compare = true;
             }
-            if operator != pg_sys::InvalidOid {
+            if let Some(length) = c.array {
+                found_array = true;
+                if length > 1.0 {
+                    sa_scans *= length;
+                }
+            }
+            if c.is_null {
+                found_is_null = true;
+                equal_here = true;
+            }
+            if c.operator != pg_sys::InvalidOid {
                 let strategy = pg_sys::get_op_opfamily_strategy(
-                    operator,
+                    c.operator,
                     *(*index).opfamily.add(column as usize),
                 );
                 if strategy == pg_sys::BTEqualStrategyNumber as i32 {
@@ -707,6 +846,46 @@ pub(crate) unsafe fn estimate(
             }
         }
     }
+    Bounds {
+        bound,
+        column,
+        equal_here,
+        found_array,
+        found_is_null,
+        correlation,
+        sa_scans,
+        skipped,
+        bounded,
+    }
+}
+
+/// The price of `path` under `rules`.
+pub(crate) unsafe fn estimate(
+    root: *mut pg_sys::PlannerInfo,
+    path: *mut pg_sys::IndexPath,
+    loop_count: f64,
+    rules: Rules,
+) -> Estimate {
+    let index = (*path).indexinfo;
+    let rel = (*index).rel;
+    let keys = (*index).nkeycolumns;
+    let (measured, leaves) = match rules.measured.then(|| measured_share(root, path)).flatten() {
+        Some((share, leaves)) => (Some(share), leaves),
+        None => (None, None),
+    };
+
+    // the conditions that bound the scan, and the scans its arrays make
+    let Bounds {
+        bound,
+        column,
+        equal_here,
+        found_array,
+        found_is_null,
+        correlation,
+        mut sa_scans,
+        skipped,
+        bounded,
+    } = bounds(root, index, path);
 
     // the entries one scan walks: the share measured where every condition of the path bounds the
     // scan, otherwise the planner's share of the conditions that bound it
@@ -723,29 +902,28 @@ pub(crate) unsafe fn estimate(
             ),
         };
         tuples = share * (*rel).tuples;
-        sa_scans = sa_scans.min(((*index).pages as f64 * 0.3333333).ceil());
-        sa_scans = sa_scans.max(1.0);
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        {
+            sa_scans = sa_scans.min(((*index).pages as f64 * 0.3333333).ceil());
+            sa_scans = sa_scans.max(1.0);
+        }
         tuples = (tuples / sa_scans).round_ties_even();
     }
 
     // the rows fetched, and the index's pages and entries
     let quals = pg_sys::get_quals_from_indexclauses((*path).indexclauses);
     let order_bys = (*path).indexorderbys;
-    if sa_scans < 1.0 {
-        sa_scans = 1.0;
-        for qual in cells(quals) {
-            let node = (*(qual as *mut pg_sys::RestrictInfo)).clause as *mut pg_sys::Node;
-            if tag(node) == pg_sys::NodeTag::T_ScalarArrayOpExpr {
-                let saop = node as *mut pg_sys::ScalarArrayOpExpr;
-                let length = compat::estimate_array_length(
-                    root,
-                    cells((*saop).args)[1] as *mut pg_sys::Node,
-                );
-                if length > 1.0 {
-                    sa_scans *= length;
-                }
-            }
+    // the scans of one execution: those the bounding conditions' arrays make
+    #[cfg(any(feature = "pg18", feature = "pg19"))]
+    {
+        if sa_scans < 1.0 {
+            sa_scans = array_scans(root, quals);
         }
+    }
+    // the scans of one execution: those every condition's arrays make
+    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    {
+        sa_scans = array_scans(root, quals);
     }
     let selectivity = match measured {
         Some(share) => share,
@@ -797,14 +975,16 @@ pub(crate) unsafe fn estimate(
     startup += descent;
     total += sa_scans * descent;
 
-    if !have_correlation {
+    let correlation = correlation.unwrap_or_else(|| {
         let mut vardata = pg_sys::VariableStatData::default();
         examine_indexcol(root, index, 0, &mut vardata);
+        let mut correlation = 0.0;
         if !vardata.statsTuple.is_null() {
             correlation = first_column_correlation(index, &vardata);
         }
         release(&mut vardata);
-    }
+        correlation
+    });
 
     Estimate {
         startup,
@@ -826,6 +1006,7 @@ pub(crate) unsafe fn estimate(
 #[pgrx::pg_schema]
 pub(crate) mod tests {
     use super::{estimate, Estimate, Rules, PAGE_IN_MEMORY, POSTGRES, SURVEYED};
+    use crate::compat;
     use crate::query::cells;
     use pgrx::pg_sys;
     use pgrx::prelude::*;
@@ -837,8 +1018,45 @@ pub(crate) mod tests {
         pub(super) static RULES: Cell<Rules> = const { Cell::new(SURVEYED) };
         /// The pages of shared buffers the surveyor's price reads, where a test gives them.
         pub(super) static SHARED_BUFFERS: Cell<Option<f64>> = const { Cell::new(None) };
+        /// The files whose pages the surveyor's price counts as out of shared buffers.
+        pub(super) static EVICTED: RefCell<Vec<(pg_sys::Oid, compat::RelFileNumber)>> =
+            const { RefCell::new(Vec::new()) };
         static RECORDING: Cell<bool> = const { Cell::new(false) };
         static RECORDS: RefCell<Vec<Record>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Takes the pages of each relation `relations` selects out of shared buffers, as the surveyor's
+    /// price reads them: from PostgreSQL 18 they are evicted; before it, where no function evicts a
+    /// relation's pages, the surveyor's count of the pages in shared buffers leaves them out.
+    pub(crate) fn evict(relations: &str) {
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        Spi::run(&format!(
+            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
+             SELECT pg_buffercache_evict_relation(listed.r) FROM ({relations}) AS listed (r)"
+        ))
+        .unwrap();
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+        {
+            let listed = Spi::connect(|client| {
+                let mut out = Vec::new();
+                let query = format!("SELECT listed.r::oid FROM ({relations}) AS listed (r)");
+                for row in client.select(&query, None, &[])? {
+                    out.extend(row.get::<pg_sys::Oid>(1)?);
+                }
+                Ok::<_, pgrx::spi::SpiError>(out)
+            })
+            .unwrap();
+            for oid in listed {
+                let lock = pg_sys::AccessShareLock as pg_sys::LOCKMODE;
+                let file = unsafe {
+                    let rel = pg_sys::relation_open(oid, lock);
+                    let file = compat::relation_file(rel);
+                    pg_sys::relation_close(rel, lock);
+                    file
+                };
+                EVICTED.with(|e| e.borrow_mut().push(file));
+            }
+        }
     }
 
     /// One path priced by the surveyor: what it was asked, its price under the rules in force, its
@@ -1075,8 +1293,12 @@ pub(crate) mod tests {
                 assert!(close(*o, *t), "{r:?}");
             }
         }
-        // among them a skip scan, a list, repeated scans, a partial index and a unique equality
+        // among them a skip scan, a list, repeated scans, a partial index and a unique equality; before
+        // PostgreSQL 18 a B-tree steps through no column a condition leaves open
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
         assert!(records.iter().any(|r| r.ours.skipped), "no skip scan");
+        #[cfg(not(any(feature = "pg18", feature = "pg19")))]
+        assert!(records.iter().all(|r| !r.ours.skipped), "a skip scan");
         assert!(
             records
                 .iter()
@@ -1193,10 +1415,22 @@ pub(crate) mod tests {
             assert!(close(r.ours.total, r.theirs[1]), "{r:?}");
         }
         // a condition under a leading column left open is measured through the values stepped
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
         let stepped = records
             .iter()
             .find(|r| r.index == "stock_shelf_bin" && r.ours.skipped && r.loop_count == 1.0)
             .unwrap_or_else(|| panic!("no skip scan: {records:?}"));
+        // before PostgreSQL 18, a condition under a leading column left open walks every entry
+        #[cfg(not(any(feature = "pg18", feature = "pg19")))]
+        let stepped = records
+            .iter()
+            .find(|r| {
+                r.index == "stock_shelf_bin"
+                    && r.loop_count == 1.0
+                    && r.quals == 1
+                    && r.ours.tuples == r.index_tuples
+            })
+            .unwrap_or_else(|| panic!("no walk of every entry: {records:?}"));
         let share = stepped
             .ours
             .measured
@@ -1235,10 +1469,11 @@ pub(crate) mod tests {
             assert!(r.ours.measured.is_some(), "{r:?}");
             let leaves = Spi::get_one::<i64>(&format!(
                 "SELECT count(DISTINCT s.blkno) \
-                 FROM bt_multi_page_stats('annotated_cat_id', 1, -1) s, \
+                 FROM {} s, \
                       LATERAL bt_page_items('annotated_cat_id', s.blkno::int) i \
                  WHERE s.type = 'l' AND i.data LIKE '{cat:02x} 00 00 00%' \
-                   AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)"
+                   AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
+                crate::compat::page_stats("annotated_cat_id")
             ))
             .unwrap()
             .unwrap() as f64;
@@ -1587,7 +1822,9 @@ pub(crate) mod tests {
             assert!(close(r.ours.total, at), "{r:?}");
             resident.push(r);
         }
-        Spi::run("SELECT pg_buffercache_evict_relation('stock_pkey')").unwrap();
+        evict("SELECT 'stock_pkey'::regclass");
+        // where a relation's pages can be evicted, none of them is left
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
         assert_eq!(in_buffers("stock_pkey"), 0.0);
         for ((query, loops), inside) in ways.into_iter().zip(resident) {
             let r = priced(query, loops);
@@ -1644,12 +1881,7 @@ pub(crate) mod tests {
     #[pg_test]
     fn every_index_page_from_outside_shared_buffers_is_priced_at_its_tablespaces_page_costs() {
         stock();
-        Spi::run(
-            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
-             SELECT pg_buffercache_evict_relation(indexrelid) FROM pg_index \
-             WHERE indrelid = 'stock'::regclass",
-        )
-        .unwrap();
+        evict("SELECT indexrelid FROM pg_index WHERE indrelid = 'stock'::regclass");
         let questions = questions();
         let queries: Vec<&str> = questions.iter().map(|q| q.as_str()).collect();
         let defaults = (setting("random_page_cost"), setting("seq_page_cost"));
@@ -1686,12 +1918,7 @@ pub(crate) mod tests {
     #[pg_test]
     fn a_declared_price_of_a_leaf_walked_in_key_order_prices_the_leaves_walked_in_order() {
         stock();
-        Spi::run(
-            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
-             SELECT pg_buffercache_evict_relation(indexrelid) FROM pg_index \
-             WHERE indrelid = 'stock'::regclass",
-        )
-        .unwrap();
+        evict("SELECT indexrelid FROM pg_index WHERE indrelid = 'stock'::regclass");
         let questions = questions();
         let mut questions = questions;
         questions.push("SELECT id FROM stock WHERE id > 0".to_string());
@@ -1748,7 +1975,7 @@ pub(crate) mod tests {
         .unwrap();
         let (random, sequential) = (setting("random_page_cost"), setting("seq_page_cost"));
         let walk = || {
-            Spi::run("SELECT pg_buffercache_evict_relation('scattered_k')").unwrap();
+            evict("SELECT 'scattered_k'::regclass");
             let records = recorded(PAGES, &["SELECT k FROM scattered WHERE k >= 0"]);
             records
                 .into_iter()
@@ -1783,7 +2010,7 @@ pub(crate) mod tests {
         .unwrap();
         let random = setting("random_page_cost");
         let walk = || {
-            Spi::run("SELECT pg_buffercache_evict_relation('strewn_k')").unwrap();
+            evict("SELECT 'strewn_k'::regclass");
             let records = recorded(PAGES, &["SELECT k FROM strewn WHERE k >= 0"]);
             records
                 .into_iter()
@@ -1858,12 +2085,7 @@ pub(crate) mod tests {
     #[pg_test]
     fn a_busy_drive_weighs_every_index_page_read_from_it() {
         stock();
-        Spi::run(
-            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
-             SELECT pg_buffercache_evict_relation(indexrelid) FROM pg_index \
-             WHERE indrelid = 'stock'::regclass",
-        )
-        .unwrap();
+        evict("SELECT indexrelid FROM pg_index WHERE indrelid = 'stock'::regclass");
         let questions = questions();
         let queries: Vec<&str> = questions.iter().map(|q| q.as_str()).collect();
         let (random, sequential) = (setting("random_page_cost"), setting("seq_page_cost"));
@@ -2100,9 +2322,12 @@ pub(crate) mod tests {
              ALTER TABLE lean ADD PRIMARY KEY (id); \
              CREATE INDEX lean_order ON lean USING surveyor (id); \
              CREATE TABLE few AS SELECT 1 + g % 300 AS id FROM generate_series(1, 3000) g; \
-             ANALYZE lean; ANALYZE few; \
-             SELECT pg_buffercache_evict_relation('lean_pkey'); \
-             SET LOCAL max_parallel_workers_per_gather = 0; \
+             ANALYZE lean; ANALYZE few",
+        )
+        .unwrap();
+        evict("SELECT 'lean_pkey'::regclass");
+        Spi::run(
+            "SET LOCAL max_parallel_workers_per_gather = 0; \
              SET LOCAL enable_mergejoin = off; SET LOCAL enable_memoize = off",
         )
         .unwrap();
@@ -2155,11 +2380,11 @@ pub(crate) mod tests {
              COPY lean (id) FROM PROGRAM 'seq 1 60000' WITH (FREEZE); \
              ALTER TABLE lean ADD PRIMARY KEY (id); \
              CREATE INDEX lean_order ON lean USING surveyor (id); \
-             ANALYZE lean; \
-             SELECT pg_buffercache_evict_relation('lean_pkey'); \
-             SET LOCAL max_parallel_workers_per_gather = 0",
+             ANALYZE lean",
         )
         .unwrap();
+        evict("SELECT 'lean_pkey'::regclass");
+        Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
         let query = "SELECT count(*) FROM lean WHERE id > 0";
         let plan = |share: f64, settings: &str| {
             busy(share, || {

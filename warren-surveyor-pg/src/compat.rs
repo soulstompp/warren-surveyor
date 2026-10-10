@@ -303,3 +303,21 @@ pub(crate) unsafe fn seed_random(seed: u32) {
         );
     }
 }
+
+/// The pages of the B-tree `index` after its metapage, each with the columns `bt_page_stats` gives
+/// it, as an item of a FROM list.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn page_stats(index: &str) -> String {
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    {
+        format!(
+            "(SELECT p.* FROM generate_series(1::int8, \
+             pg_relation_size('{index}') / current_setting('block_size')::int8 - 1) b, \
+             LATERAL bt_page_stats('{index}', b) p)"
+        )
+    }
+    #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+    {
+        format!("bt_multi_page_stats('{index}', 1, -1)")
+    }
+}

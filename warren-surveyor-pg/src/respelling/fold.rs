@@ -110,22 +110,31 @@ mod tests {
 
     #[pg_test]
     fn a_unique_column_not_null_by_a_constraint_not_validated_leaves_the_statement_as_written() {
-        Spi::run(
+        // a NOT NULL constraint takes NOT VALID from PostgreSQL 18; before it, a column is NOT NULL
+        // only once SET NOT NULL has read every row, and the constraint not validated is a CHECK
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        let (unchecked, validated) = (
+            "ALTER TABLE counted ADD CONSTRAINT counted_u_not_null NOT NULL u NOT VALID",
+            "ALTER TABLE counted VALIDATE CONSTRAINT counted_u_not_null",
+        );
+        #[cfg(not(any(feature = "pg18", feature = "pg19")))]
+        let (unchecked, validated) = (
+            "ALTER TABLE counted ADD CONSTRAINT counted_u_not_null CHECK (u IS NOT NULL) NOT VALID",
+            "ALTER TABLE counted VALIDATE CONSTRAINT counted_u_not_null; \
+             ALTER TABLE counted ALTER COLUMN u SET NOT NULL",
+        );
+        Spi::run(&format!(
             "CREATE TABLE counted (u int UNIQUE, k int); \
              INSERT INTO counted VALUES (NULL, 1), (NULL, 1), (1, 1); \
-             ALTER TABLE counted ADD CONSTRAINT counted_u_not_null NOT NULL u NOT VALID; \
+             {unchecked}; \
              CREATE TABLE beside (k int, g int, w int); \
-             INSERT INTO beside VALUES (1, 1, 10)",
-        )
+             INSERT INTO beside VALUES (1, 1, 10)"
+        ))
         .unwrap();
         assert_eq!(rows(COUNTED_BESIDE), ["1 | 1 | 30"]);
         assert!(!respelled(COUNTED_BESIDE));
         // validated, the constraint holds of every row
-        Spi::run(
-            "DELETE FROM counted WHERE u IS NULL; \
-             ALTER TABLE counted VALIDATE CONSTRAINT counted_u_not_null",
-        )
-        .unwrap();
+        Spi::run(&format!("DELETE FROM counted WHERE u IS NULL; {validated}")).unwrap();
         assert!(respelled(COUNTED_BESIDE));
         assert_eq!(rows(COUNTED_BESIDE), ["1 | 1 | 10"]);
     }

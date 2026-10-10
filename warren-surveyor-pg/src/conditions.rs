@@ -1231,10 +1231,11 @@ pub(crate) mod tests {
         Spi::run("CREATE EXTENSION IF NOT EXISTS pageinspect").unwrap();
         Spi::get_one::<i64>(&format!(
             "SELECT count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('{index}', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('{index}', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '02 00 00 00%' \
-               AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)"
+               AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
+            crate::compat::page_stats(index)
         ))
         .unwrap()
         .unwrap() as u32
@@ -1297,13 +1298,14 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap();
         Spi::run("CREATE EXTENSION IF NOT EXISTS pageinspect").unwrap();
-        let wide = Spi::get_one::<f64>(
+        let wide = Spi::get_one::<f64>(&format!(
             "SELECT 2000.0::float8 / count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('annotated_cat_id', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('annotated_cat_id', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '07 00 00 00%' \
                AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
-        )
+            crate::compat::page_stats("annotated_cat_id")
+        ))
         .unwrap()
         .unwrap();
         assert!(
