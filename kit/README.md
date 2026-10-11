@@ -1,18 +1,18 @@
 # The kit: rerun the surveyor's benchmark yourself
 
 The surveyor is an index that is never scanned and holds nothing. You put one on a table. While a
-statement is planned, it reads the indexes you already have (your B-trees, and the GIN and GiST
-indexes that search words, trigrams, boxes and distances) and tells PostgreSQL's planner what they
-measure. Its library also respells a `SELECT`: it plans it through another spelling that returns
-the same rows and is written to read less. The point is to avoid the disk: fewer pages read from
-outside shared buffers.
+statement is planned, it reads your indexes (the B-trees, and the GIN and GiST indexes that search
+words, trigrams, boxes and distances) and tells PostgreSQL's planner what they measure. Its library
+also respells a `SELECT`: it plans it through another spelling that returns the same rows and is
+written to read less. The point is to avoid the disk: fewer pages read from outside shared buffers.
 
 This kit lets you check that on your own server. One command, `kit/run.sh`, installs what it
 needs and runs seven steps:
 
-1. load a real LEGO catalogue, and a large made-up one built from it to trip indexes (skewed
-   purchases, themes under many roots, names typed each builder's own way, clocks that change),
-   with the indexes a DBA would give it;
+1. load a real catalogue of bricks and sets, and a large made-up one that
+   [sqlc-brickgen][sqlc-brickgen] builds from it to trip indexes (skewed purchases, themes under
+   many roots, names typed each builder's own way, clocks that change), with the indexes a DBA
+   would give it;
 2. turn the surveyor off;
 3. record every answer with PostgreSQL alone;
 4. time every question with PostgreSQL alone;
@@ -154,9 +154,10 @@ DB=postgres://USER@HOST:5432/lego
 
 ## Where the data comes from, and its terms
 
-The kit ships no data: step 1 downloads the real catalogue to your machine, and `sqlc-brickgen`
-builds the rest from it and from the cities it ships, Natural Earth's populated places (public
-domain). The catalogue is Neon's sample dump, `lego.sql` in
+The kit ships no data: step 1 downloads the real catalogue to your machine, and
+[sqlc-brickgen][sqlc-brickgen], which lives in sql-composer's repository, builds the rest from it
+and from the cities it ships, Natural Earth's populated places (public domain). The catalogue is
+Neon's sample dump, `lego.sql` in
 [neondatabase/postgres-sample-dbs](https://github.com/neondatabase/postgres-sample-dbs), a
 repository under the MIT licence, whose README gives the data's source as Kaggle's
 [LEGO Database](https://www.kaggle.com/datasets/rtatman/lego-database) (rtatman), which Kaggle lists
@@ -178,14 +179,14 @@ sqlc-brickgen --database-url $DB --size small \
 ```
 
 The first two make the kit's database and load the real catalogue into its `public` schema: eight
-`lego_*` tables of colours, themes, part categories, parts, sets, inventories and their lines. The
-generator reads them, writes them through into the schema `lego`, and adds the made-up catalogue:
-20 thousand more sets at `small`, 2 million at `huge`, with their builders, the builders'
-collections and their purchases, and every trap it knows. It also builds the DBA's indexes, the
-ones every later step measures against: the primary and unique keys, composite indexes for the
-joins holding in `INCLUDE` the columns the questions read, and an index for each search those do
-not serve, a postcode by its prefix (a B-tree), a home by its distance (GiST), a part's name by its
-words and a name by its trigrams (GIN).
+`lego_*` tables of colours, themes, part categories, parts, sets, inventories and their lines.
+sqlc-brickgen reads them, writes them through into the schema `lego`, and adds the made-up
+catalogue: 20 thousand more sets at `small`, 2 million at `huge`, with their builders, the
+builders' collections and their purchases, and every trap it knows. It also builds the DBA's
+indexes, the ones every later step measures against: the primary and unique keys, composite
+indexes for the joins holding in `INCLUDE` the columns the questions read, and an index for each
+search those do not serve, a postcode by its prefix (a B-tree), a home by its distance (GiST), a
+part's name by its words and a name by its trigrams (GIN).
 
 `--oo-schema lego_oo` adds the same rows decomposed by table inheritance into classes (sets by
 kind of theme, colours by hue, builders by country); question 19 reads its colour wheel,
@@ -417,3 +418,5 @@ The kit (this directory, and the questions and script inside `warren-bench`) and
 are licensed under either of the Apache License, Version 2.0 or the MIT license, at your option
 ([LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT)). `warren-surveyor-pg` is under the
 GNU General Public License, version 3 or later.
+
+[sqlc-brickgen]: https://github.com/soulstompp/sql-composer/tree/HEAD/examples/sqlc-brickgen

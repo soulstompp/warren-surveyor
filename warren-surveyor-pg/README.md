@@ -3,10 +3,10 @@
 *It measures without digging.*
 
 The surveyor is an index for PostgreSQL 14 to 18 that is never scanned and holds nothing. You put
-one on a table, on the table's own unique key. While a statement is planned, it reads the indexes
-you already have, your B-trees and the GIN and GiST indexes that search words, trigrams, boxes and
-distances, from the top, stopping above the leaf pages wherever it can. Then it hands the planner
-what it finds:
+one on a table, on the table's own unique key. While a statement is planned, it reads your
+indexes, the B-trees and the GIN and GiST indexes that search words, trigrams, boxes and distances,
+from the top, stopping above the leaf pages wherever it can. Then it hands the planner what it
+finds:
 
 - the rows each table's conditions select;
 - the column statistics that joins and groupings are sized by;
@@ -27,7 +27,7 @@ is taken on each side first, and one side is grouped only at the keys the other 
 
 It is the extension `warren_surveyor_pg`, and its access method is `surveyor`. To watch it work on
 your own server, on a database built to trip indexes, with every answer checked, start with
-[the kit](../kit/README.md): one command, `kit/run.sh`, runs it all.
+[the kit][kit]: one command, `kit/run.sh`, runs it all.
 
 ## Install
 
@@ -336,7 +336,7 @@ another.
 **What it reads.** For the database's own tablespace and the tablespace of each table with a
 surveyor that the statement reads or writes, through a view or as a member of a table it reads with
 its members: the drive holding it, and from `/proc/diskstats` and `/proc/uptime`, the share of the
-machine's uptime the drive has spent doing I/O. Once for each statement planned.
+machine's uptime the drive has spent busy. Once for each statement planned.
 
 **The scan it cancels.** A page from a busy drive waits. Priced as if the drive were idle, a plan
 that reads the disk wins on paper and loses on the server.
@@ -373,11 +373,11 @@ it.
 
 ### The respelling
 
-**What it reads.** In a session that has loaded the library, every `SELECT`, with a surveyor on its
-tables or none, and the catalog where a rule needs it, as [warren-pg-speller's
-README](../warren-pg-speller/README.md#what-it-reads-from-the-catalog) sets out. Wherever the
-statement and the catalog show it returns the same rows, the statement is planned through another
-spelling of it:
+**What it reads.** While PostgreSQL plans, in a session that has loaded the library: every
+`SELECT`, with a surveyor on its tables or none, as PostgreSQL parsed it, and the catalog where a
+rule needs it, as [warren-pg-speller's README][speller-catalog] sets out. Wherever the statement
+and the catalog show it returns the same rows, the statement is planned through another spelling of
+it:
 
 - *a join every arm of a `UNION ALL` shares is made once*, to a `UNION ALL` of the rest of each
   arm;
@@ -399,12 +399,16 @@ read twice: by the join of the two sides, and under side B's grouping, which kee
 `side_a` holds.
 
 **Where it stops.** Where any condition a rule checks fails, the statement is planned as written;
-every condition is in [warren-pg-speller's README](../warren-pg-speller/README.md). Nothing is
-respelled inside a parallel operation. A respelling that raises an error once it has begun to build
-a spelling, a cancel apart, is rolled back, and the statement is planned as written, with the
-budget and the surveyor's measures as they stood before the respelling began; the two plannings
-together may then read up to twice the budget. An error while it is still deciding whether a rule
-applies fails the statement.
+every condition is in [warren-pg-speller's README][speller]. Nothing is respelled inside a parallel
+operation. A respelling that raises an error once it has begun to build a spelling, a cancel apart,
+is rolled back, and the statement is planned as written, with the budget and the surveyor's
+measures as they stood before the respelling began; the two plannings together may then read up to
+twice the budget. An error while it is still deciding whether a rule applies fails the statement.
+
+This respelling is made while PostgreSQL plans, from the statement and the catalog. The one the
+composed text proves alone is made before: a union whose arms each read one relation for their own
+rows of it is written into the composed file by [sql-composer's `--respell`][respell], and the
+library plans that file as it plans any statement.
 
 ## Checking it
 
@@ -453,8 +457,10 @@ Almost nothing, and nothing on the disk:
   It stays at 0 bytes through inserts, updates and deletes, `VACUUM`, `VACUUM FULL`, `REINDEX`
   (`CONCURRENTLY` too) and `TRUNCATE`.
 - **Nothing written.** A new row is nothing to a surveyor, and writes nothing to the WAL for it.
-- **HOT stays HOT.** A surveyor never keeps an update from being HOT: an update may change the
-  columns it names and still be a HOT update.
+- **HOT stays HOT, from PostgreSQL 16.** On 16 to 18 a surveyor never keeps an update from being
+  HOT: an update may change the columns it names and still be a HOT update. On 14 and 15, as with
+  any index there, an update that changes a column a surveyor names is not HOT, and building a
+  surveyor warns so.
 - **The table's count is left alone.** A build reports no count of rows, so the table's own count
   stays as `ANALYZE` or `VACUUM` left it.
 - **It is never in a plan.** No condition matches it and no plan reads it, so
@@ -626,12 +632,13 @@ writes it.
   method `surveyor`, with a comment `\dA+` shows;
 - 17 default operator classes for `surveyor`, each named for its type (`int4_ops`, `text_ops`, …),
   each with the B-tree's comparison function for its type and, for most, its sort support;
-- the domain `warren_key`, `text` under the collation `pg_c_utf8`: text that orders by code point
-  whatever the operating system's locale data. Where the schema has a `warren_key` already, it is
-  kept only where another extension made it as that same domain and a superuser owns it, since
-  whoever owns a type may attach a check to it; any other stops the install with `type
-  <schema>.warren_key exists, and is not a domain over text with collation pg_c_utf8 that an
-  extension made and a superuser owns`;
+- the domain `warren_key`, text that orders by code point whatever the operating system's locale
+  data: `text` under the collation `pg_c_utf8` from PostgreSQL 17, and under `"C"` before it, which
+  orders UTF-8 text the same way. Where the schema has a `warren_key` already, it is kept only where
+  another extension made it as that same domain and a superuser owns it, since whoever owns a type
+  may attach a check to it; any other stops the install with `type <schema>.warren_key exists, and
+  is not a domain over text with collation pg_c_utf8 that an extension made and a superuser owns`,
+  with `"C"` in place of `pg_c_utf8` before 17;
 - the settings `warren_surveyor_pg.walked_leaf_page_cost` and
   `warren_surveyor_pg.planning_read_limit`, registered when the library loads.
 
@@ -668,4 +675,10 @@ Copyright (C) 2026 Kenneth Allen Flegal
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU
 General Public License as published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version. See [LICENSE](LICENSE).
+License, or (at your option) any later version. See [LICENSE][LICENSE].
+
+[kit]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/kit/README.md
+[speller]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md
+[speller-catalog]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md#what-it-reads-from-the-catalog
+[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#--respell
+[LICENSE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-surveyor-pg/LICENSE

@@ -6,7 +6,7 @@ time. Every answer is checked against one fixed beforehand, so no figure stands 
 was wrong.
 
 It is the kit's runner. The walkthrough, from an empty server to the result table, is
-[the kit](../kit/README.md). This page is the bench's reference, in the order a run uses each part:
+[the kit][kit]. This page is the bench's reference, in the order a run uses each part:
 installing it, what it touches, the questions, the targets, the index sets, the repetitions, the
 files it writes and its exit status.
 
@@ -74,7 +74,7 @@ files are read from.
 `surveyor.sql`, to read or edit, and writes nothing where any of them exists already;
 `--questions DIR/questions --binds DIR/binds.tsv` then runs them. `warren-bench kit surveyor-sql`
 prints `surveyor.sql`, the script that turns the surveyor on or off for a whole database, for
-`psql -f -` ([the kit](../kit/README.md) runs it in its steps 2 and 5).
+`psql -f -` ([the kit][kit] runs it in its steps 2 and 5).
 
 A questions directory holds plain `.sql` files or `.sqlc` templates, never both. Each file is one
 question, named by its path without the extension (`single/01_purchases_per_day_december_2020`),
@@ -82,11 +82,14 @@ and the questions are taken in the order of their names.
 
 - **Plain `.sql` files** are sent as written. A question with bound values marks them `$1`, `$2`,
   …, and the binds file gives them.
-- **`.sqlc` templates** are composed once per target with sql-composer's `cargo sqlc compose
-  --skip-prepare`, then checked with `--verify`. A template reads the target's table through
-  `:compose(target/table.sqlc)`, which the bench writes for each target as `SELECT * FROM <the
-  target's table>`; every target's composed questions must be the same text but for the table's
-  name. A template with an open slot (`:compose(@slot)`) is a shape and no question.
+- **`.sqlc` templates** are composed by [sql-composer](https://github.com/soulstompp/sql-composer),
+  once per target with `cargo sqlc compose --skip-prepare`, then checked with `--verify`. A template
+  reads the target's table through `:compose(target/table.sqlc)`, which the bench writes for each
+  target as `SELECT * FROM <the target's table>`; every target's composed questions must be the
+  same text but for the table's name. A template with an open slot (`:compose(@slot)`) is a shape
+  and no question. `--with` and `--respell` compose the templates with those flags of
+  `cargo sqlc compose`, and `--search-path DIR` composes them with relations from `DIR` too, which
+  are not questions themselves; a plain question takes none of the three.
 
 Each target's questions, composed or plain, are written under `--work`, by default `compose` in the
 cache directory.
@@ -216,8 +219,9 @@ flags below; everything else comes from the sample file.
   and terminates the backend if it is still running `--terminate-after-s` (30) later. Ctrl-C
   cancels it the same way. The memory is read from `/proc`, so the bench refuses a server whose
   backends it cannot see there unless given `--no-memory-watchdog`.
-- The bench does not start, and a run stops, while the generator is loading: a session on the
-  server whose `application_name` starts with `sqlc-brickgen`.
+- The bench does not start, and a run stops, while [sqlc-brickgen][sqlc-brickgen], the generator
+  of the kit's database, is loading: a session on the server whose `application_name` starts with
+  `sqlc-brickgen`.
 
 ## What the bench writes
 
@@ -349,5 +353,10 @@ surveyor on each, or `warren_bench_check`, with one table of the types an answer
 
 ## Licence
 
-`MIT OR Apache-2.0`, at your option: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE).
+`MIT OR Apache-2.0`, at your option: [LICENSE-MIT][LICENSE-MIT], [LICENSE-APACHE][LICENSE-APACHE].
 Copyright Kenneth Allen Flegal.
+
+[kit]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/kit/README.md
+[sqlc-brickgen]: https://github.com/soulstompp/sql-composer/tree/HEAD/examples/sqlc-brickgen
+[LICENSE-MIT]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-bench/LICENSE-MIT
+[LICENSE-APACHE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-bench/LICENSE-APACHE

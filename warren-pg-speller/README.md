@@ -26,6 +26,11 @@ other than a cancel. A spelling is built from the statement as PostgreSQL parsed
 text, and reads no table the statement does not read: each as the statement reads it, as the owner
 of the view it lies in or as the user running the statement, under the same row security.
 
+A statement [sql-composer](https://github.com/soulstompp/sql-composer) composes reaches PostgreSQL
+as plain SQL, and is read as any other. The one respelling its composed text proves alone, a union
+whose arms each read one relation for their own rows of it, sql-composer writes into the file
+itself, under [`--respell`][respell]; the rules below rest on the catalog, and are the speller's.
+
 ## Rule 1: a join every arm of a UNION ALL shares is made once
 
 ### What it changes
@@ -55,7 +60,8 @@ original order. The union's WITH queries, ORDER BY, LIMIT and OFFSET stay on the
 ### The read it cancels
 
 As written, A is read once for each arm and joined in each. Respelled, it is read and joined once,
-to the rows of every arm's rest together. Where A is a WITH query, as written each arm reads it;
+to the rows of every arm's rest together. Where A is a WITH query, or a subquery that reads one (as
+`cargo sqlc compose --with` writes a relation every arm reads), as written each arm reads it;
 respelled, it is read once, and where nothing else reads it PostgreSQL may read it in place instead
 of storing it.
 
@@ -336,11 +342,15 @@ Copyright (c) 2026 Kenneth Allen Flegal
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE][LICENSE-APACHE])
+- MIT license ([LICENSE-MIT][LICENSE-MIT])
 
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the
 work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
+
+[LICENSE-APACHE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/LICENSE-APACHE
+[LICENSE-MIT]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/LICENSE-MIT
+[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#--respell

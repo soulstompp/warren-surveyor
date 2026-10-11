@@ -2,7 +2,7 @@
 
 ## 0.1.2
 
-- Once a join is taken out of a UNION ALL's arms, every WITH query the statement can read counts its
+- Once a join is taken out of a UNION ALL's arms, every WITH query the union can read counts its
   readers again, wherever they are. A WITH query each arm read through a subquery, as
   `cargo sqlc compose --with` writes one, is read in its reader's place once one reader is left, and
   the grouping over it is taken on each side as it is where each arm holds the query's body.
