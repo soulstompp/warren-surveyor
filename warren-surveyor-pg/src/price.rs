@@ -662,14 +662,9 @@ struct Bounds {
     bounded: bool,
 }
 
-#[cfg(feature = "pg17")]
-compile_error!(
-    "the B-tree price, and the eviction its tests make, are not written for PostgreSQL 17"
-);
-
 /// The conditions that bound `path`'s scan through `index`: each column's, up to the first column
 /// without an equality and the column after it; a column with no condition at all ends them.
-#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
 unsafe fn bounds(
     root: *mut pg_sys::PlannerInfo,
     index: *mut pg_sys::IndexOptInfo,
@@ -902,7 +897,7 @@ pub(crate) unsafe fn estimate(
             ),
         };
         tuples = share * (*rel).tuples;
-        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         {
             sa_scans = sa_scans.min(((*index).pages as f64 * 0.3333333).ceil());
             sa_scans = sa_scans.max(1.0);
@@ -914,7 +909,7 @@ pub(crate) unsafe fn estimate(
     let quals = pg_sys::get_quals_from_indexclauses((*path).indexclauses);
     let order_bys = (*path).indexorderbys;
     // the scans of one execution: those the bounding conditions' arrays make
-    #[cfg(any(feature = "pg18", feature = "pg19"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     {
         if sa_scans < 1.0 {
             sa_scans = array_scans(root, quals);
@@ -1026,13 +1021,23 @@ pub(crate) mod tests {
     }
 
     /// Takes the pages of each relation `relations` selects out of shared buffers, as the surveyor's
-    /// price reads them: from PostgreSQL 18 they are evicted; before it, where no function evicts a
-    /// relation's pages, the surveyor's count of the pages in shared buffers leaves them out.
+    /// price reads them: from PostgreSQL 17 they are evicted, a buffer at a time on 17 and a
+    /// relation at a time from 18; before 17, where no function evicts a page, the surveyor's count
+    /// of the pages in shared buffers leaves them out.
     pub(crate) fn evict(relations: &str) {
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         Spi::run(&format!(
             "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
              SELECT pg_buffercache_evict_relation(listed.r) FROM ({relations}) AS listed (r)"
+        ))
+        .unwrap();
+        #[cfg(feature = "pg17")]
+        Spi::run(&format!(
+            "CREATE EXTENSION IF NOT EXISTS pg_buffercache; \
+             SELECT pg_buffercache_evict(b.bufferid) \
+             FROM pg_buffercache b \
+             JOIN ({relations}) AS listed (r) ON b.relfilenode = pg_relation_filenode(listed.r) \
+             JOIN pg_database d ON d.oid = b.reldatabase AND d.datname = current_database()"
         ))
         .unwrap();
         #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
@@ -1217,12 +1222,22 @@ pub(crate) mod tests {
             "SELECT id FROM stock WHERE lot = 3 AND bin < 100",
             "SELECT id FROM stock ORDER BY shelf, bin LIMIT 10",
             "SELECT id FROM stock WHERE shelf < 20",
+            "SELECT id FROM stock WHERE shelf < 20 AND bin IN (5, 15, 25)",
             "SELECT s.bin FROM picks p JOIN stock s ON s.id = p.id",
             "SELECT count(*) FROM picks p JOIN stock s ON s.shelf = p.pick % 50 AND s.bin < 500",
         ]
         .iter()
         .map(|q| q.to_string())
-        .chain([format!("SELECT id FROM stock WHERE {DECEMBER}")])
+        .chain([
+            format!("SELECT id FROM stock WHERE {DECEMBER}"),
+            format!(
+                "SELECT id FROM stock WHERE shelf = 7 AND bin IN ({})",
+                (0..400)
+                    .map(|b| (b * 2).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ])
         .collect()
     }
 
@@ -1824,7 +1839,7 @@ pub(crate) mod tests {
         }
         evict("SELECT 'stock_pkey'::regclass");
         // where a relation's pages can be evicted, none of them is left
-        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         assert_eq!(in_buffers("stock_pkey"), 0.0);
         for ((query, loops), inside) in ways.into_iter().zip(resident) {
             let r = priced(query, loops);

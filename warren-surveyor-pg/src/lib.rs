@@ -477,8 +477,9 @@ mod tests {
         }
     }
 
-    #[pg_test]
-    fn an_update_of_the_columns_a_surveyor_names_stays_hot() {
+    /// 2,000 rows with room left on every page and a surveyor on (a, b), then every tenth row's a
+    /// and b changed: the rows the update changed, and how many of them it changed HOT.
+    fn update_the_columns_a_surveyor_names() -> (i64, i64) {
         Spi::run(
             "CREATE TABLE kept (id int PRIMARY KEY, a int, b text) WITH (fillfactor = 50); \
              INSERT INTO kept SELECT g, g % 100, 'b' || g FROM generate_series(1, 2000) g; \
@@ -491,11 +492,66 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let hot =
+            Spi::get_one::<i64>("SELECT pg_stat_get_xact_tuples_hot_updated('kept'::regclass)")
+                .unwrap()
+                .unwrap();
+        (updated, hot)
+    }
+
+    #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+    #[pg_test]
+    fn an_update_of_the_columns_a_surveyor_names_stays_hot() {
+        let (updated, hot) = update_the_columns_a_surveyor_names();
         assert_eq!(updated, 200);
+        assert_eq!(hot, updated);
+    }
+
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    #[pg_test]
+    fn before_16_a_surveyor_warns_at_its_build_that_an_update_of_its_columns_is_not_hot() {
+        Spi::run("SET LOCAL log_min_messages = warning").unwrap();
+        let (warnings, (updated, hot)) = warnings_of(update_the_columns_a_surveyor_names);
         assert_eq!(
-            Spi::get_one::<i64>("SELECT pg_stat_get_xact_tuples_hot_updated('kept'::regclass)"),
-            Ok(Some(updated))
+            warnings,
+            vec!["an UPDATE that changes a column surveyor \"kept_ab\" names is no longer HOT"]
         );
+        assert_eq!(updated, 200);
+        assert_eq!(hot, 0);
+    }
+
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    thread_local! {
+        static WARNINGS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    static mut NEXT_LOG: pg_sys::emit_log_hook_type = None;
+
+    /// Keeps each warning's message, then passes it on.
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    #[pg_guard]
+    unsafe extern "C-unwind" fn keep_warning(data: *mut pg_sys::ErrorData) {
+        if (*data).elevel == pg_sys::WARNING as i32 && !(*data).message.is_null() {
+            let message = std::ffi::CStr::from_ptr((*data).message);
+            WARNINGS.with(|w| w.borrow_mut().push(message.to_string_lossy().into_owned()));
+        }
+        if let Some(next) = NEXT_LOG {
+            next(data);
+        }
+    }
+
+    /// The warnings the server logged while `f` ran, and what `f` returned.
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    fn warnings_of<T>(f: impl FnOnce() -> T) -> (Vec<String>, T) {
+        WARNINGS.with(|w| w.borrow_mut().clear());
+        unsafe {
+            NEXT_LOG = pg_sys::emit_log_hook;
+            pg_sys::emit_log_hook = Some(keep_warning);
+        }
+        let out = f();
+        unsafe { pg_sys::emit_log_hook = NEXT_LOG };
+        (WARNINGS.with(|w| w.borrow().clone()), out)
     }
 
     #[pg_test(error = "access method \"surveyor\" does not support ASC/DESC options")]
