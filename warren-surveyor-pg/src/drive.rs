@@ -33,9 +33,9 @@
 //! The same statement is planned with `effective_cache_size` at `shared_buffers` wherever it is set
 //! above them, on an idle drive as on a busy one, and it is put back after the planning in the same
 //! way. Where PostgreSQL counts the pages that repeated scans fetch, of a table or of an index, it
-//! shares that cache among the statement's tables by their pages (costsize.c:908-961, 18.6), and the
-//! surveyor shares shared buffers among them in the same way for the index's own pages (`price`). A
-//! cache set below shared buffers is kept.
+//! shares that cache among the statement's tables by their pages (costsize.c:908-961, 18.6); the
+//! surveyor counts each index's own pages alone against the same cache (`price`). A cache set below
+//! shared buffers is kept.
 //!
 //! A drive's own page costs, measured on it, are declared on the tablespace that lies on it
 //! (`ALTER TABLESPACE … SET (seq_page_cost = …, random_page_cost = …)`), and not in the settings

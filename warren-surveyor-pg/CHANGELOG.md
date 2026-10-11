@@ -14,8 +14,8 @@
   `shared_buffers` reads as `shared_buffers`, and is put back after, an error included. The table
   pages repeated lookups fetch are counted against the cache the surveyor prices its B-trees'
   pages against, instead of the operating system's file cache besides.
-- Repeated scans of a B-tree count its part of shared buffers, shared with the statement's tables
-  by their pages as PostgreSQL shares its cache, instead of all of the index's own pages.
+- Repeated scans of a B-tree hold its pages up to a lesser `effective_cache_size`, where one is set
+  below `shared_buffers`.
 - `ALTER EXTENSION warren_surveyor_pg UPDATE` takes a 0.1.0 install to 0.1.1.
 - The respelling of `warren-pg-speller` 0.1.2, installed with the library.
 

@@ -14,12 +14,13 @@
 //!   counted exactly those conditions, and the index's own measure of them otherwise. Where every
 //!   one of them bounds the scan and the index was read for exactly them, the leaves it measured
 //!   them on are the pages the scan touches, in place of the entries' share of the index's pages.
-//! - The index's own pages. One scan's share of shared buffers is all of the index's pages up to
-//!   the whole of `shared_buffers`. Repeated scans' share is the index's part of the cache the
-//!   planner counts while the statement is planned, `shared_buffers` (`drive`), shared among the
-//!   statement's tables and the index by their pages, as the planner shares its cache. Each page the
-//!   scans touch is fetched first once, and the pages repeated scans fetch again are counted as the
-//!   B-tree counts them, with that share in place of the planner's share of the cache. A first
+//! - The index's own pages, each index alone, whatever other tables the statement reads. One
+//!   scan's share of shared buffers is all of the index's pages up to the whole of
+//!   `shared_buffers`; repeated scans' share is all of them up to the whole of the cache the
+//!   planner counts while the statement is planned, `shared_buffers` or a lesser
+//!   `effective_cache_size` (`drive`). Each page the scans touch is fetched first once, and the
+//!   pages repeated scans fetch again are counted as the B-tree counts them, with that share in
+//!   place of the planner's share of the cache. A first
 //!   fetch costs `PAGE_IN_MEMORY` where the page is in shared buffers now, whatever the
 //!   tablespace's page costs: of the pages the scans touch, the share of the index's pages in
 //!   shared buffers when the plan is made, counted once in the round of planning from the buffers'
@@ -81,8 +82,7 @@ pub(crate) fn planning_read_limit() -> i32 {
 const PAGE_CPU_MULTIPLIER: f64 = 50.0;
 
 /// Which of the surveyor's changes a price takes. With either page rule, the index's pages are
-/// counted with its share of shared buffers: all of its pages for one scan, and its part of the
-/// statement's pages for repeated scans.
+/// counted alone, with its own share of the cache.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Rules {
     /// The share an index measures stands for the planner's estimate of it.
@@ -491,18 +491,14 @@ unsafe fn shared_share(index: *mut pg_sys::IndexOptInfo) -> f64 {
     shared_buffers().min(pages)
 }
 
-/// The pages of `index` repeated scans count as held: its part of the cache, `shared_buffers` or a
-/// lesser `effective_cache_size`, shared among the statement's tables and the index by their
-/// pages, as `index_pages_fetched` shares the planner's cache (costsize.c:908-961, 18.6).
-unsafe fn repeated_share(root: *mut pg_sys::PlannerInfo, index: *mut pg_sys::IndexOptInfo) -> f64 {
+/// The pages of `index` repeated scans count as held: all of the index's own pages, up to the whole
+/// of the cache, `shared_buffers` or a lesser `effective_cache_size`, whatever other tables the
+/// statement reads.
+unsafe fn repeated_share(index: *mut pg_sys::IndexOptInfo) -> f64 {
     let pages = (*index).pages.max(1) as f64;
-    let cache = shared_buffers().min(pg_sys::effective_cache_size as f64);
-    let held = cache * pages / ((*root).total_table_pages + pages).max(1.0);
-    if held <= 1.0 {
-        1.0
-    } else {
-        held.ceil()
-    }
+    shared_buffers()
+        .min(pg_sys::effective_cache_size as f64)
+        .min(pages)
 }
 
 /// The pages of `index` fetched by scans that touch `touched` pages in all, a page touched by two
@@ -561,7 +557,7 @@ unsafe fn page_price(
     // the index's share of shared buffers, the pages the scans touch, and the pages fetched with
     // that share held
     let (shared, touched, fetched, per) = if scans > 1.0 {
-        let shared = repeated_share(root, index);
+        let shared = repeated_share(index);
         let touched = pages * scans;
         (
             shared,
@@ -1266,15 +1262,15 @@ pub(crate) mod tests {
     }
 
     /// The pages of `r`'s index its scans fetch over every loop, by the planner's own count with
-    /// the cache it counted while the path was priced, shared among the statement's tables: of the
-    /// pages the B-tree's own price counts one scan touching, and of those the surveyor counts; and
-    /// the loops they are shared among.
+    /// the cache it counted while the path was priced: with the statement's tables sharing the
+    /// cache, as the B-tree's own price counts them, and with the index alone in the cache, as a
+    /// statement that reads no table would; and the loops they are shared among.
     fn fetched(r: &Record) -> (f64, f64, f64) {
         let scans = r.ours.sa_scans * r.loop_count;
         if scans > 1.0 {
             (
-                planners_count(r, r.theirs[4] * scans),
-                planners_count(r, r.ours.pages * scans),
+                planners_count(r, r.theirs[4] * scans, r.table_pages),
+                planners_count(r, r.ours.pages * scans, 0.0),
                 r.loop_count,
             )
         } else {
@@ -1283,11 +1279,11 @@ pub(crate) mod tests {
     }
 
     /// The planner's own count of the pages of `r`'s index fetched by scans that touch `touched`
-    /// pages in all, with the cache it counted and the statement's tables' pages while the path was
-    /// priced.
-    fn planners_count(r: &Record, touched: f64) -> f64 {
+    /// pages in all, while the statement's tables hold `table_pages`, with the cache it counted
+    /// while the path was priced.
+    fn planners_count(r: &Record, touched: f64, table_pages: f64) -> f64 {
         let mut root: pg_sys::PlannerInfo = unsafe { std::mem::zeroed() };
-        root.total_table_pages = r.table_pages;
+        root.total_table_pages = table_pages;
         unsafe {
             let now = pg_sys::effective_cache_size;
             pg_sys::effective_cache_size = r.cache as i32;
@@ -1302,15 +1298,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The pages of `r`'s index the planner counts as held through repeated scans: its part of the
-    /// cache, shared among the statement's tables and the index by their pages.
+    /// The pages of `r`'s index counted as held through repeated scans: all of its pages, up to the
+    /// whole of the cache the planner counted.
     fn share(r: &Record) -> f64 {
-        let held = r.cache * r.index_pages.max(1.0) / (r.table_pages + r.index_pages).max(1.0);
-        if held <= 1.0 {
-            1.0
-        } else {
-            held.ceil()
-        }
+        r.cache.min(r.index_pages.max(1.0))
     }
 
     #[pg_test]
@@ -1588,7 +1579,7 @@ pub(crate) mod tests {
     }
 
     #[pg_test]
-    fn lookups_beside_a_larger_table_hold_less_of_their_index_and_fetch_more_of_it_again() {
+    fn lookups_into_an_index_the_cache_holds_fetch_at_most_its_pages_whatever_else_is_read() {
         stock();
         ledger();
         let pages = pages_of("stock_pkey");
@@ -1605,27 +1596,23 @@ pub(crate) mod tests {
                 .find(|r| r.index == "stock_pkey" && r.loop_count == 5000.0)
                 .unwrap_or_else(|| panic!("{query}: {records:?}"))
                 .clone();
-            // the lookups touch the index many times over, and fetch the pages the planner counts
-            // with the statement's tables sharing the cache
+            // the lookups touch the index many times over, and fetch no more than its pages
             assert_eq!(lookup.index_pages, pages, "{lookup:?}");
             let touched = lookup.ours.pages * lookup.ours.sa_scans * lookup.loop_count;
             assert!(touched > 10.0 * pages, "{lookup:?}");
-            assert_eq!(
-                lookup.ours.fetched,
-                planners_count(&lookup, touched),
-                "{lookup:?}"
-            );
+            assert!(lookup.ours.fetched <= pages, "{lookup:?}");
             lookups.push(lookup);
         }
-        // beside a table many times the index's size, the index holds less of the cache, and the
-        // lookups fetch more of it again
+        // beside a table many times the index's size, the lookups fetch as many pages
         assert!(lookups[1].table_pages > 10.0 * pages, "{lookups:?}");
-        assert!(share(&lookups[1]) < share(&lookups[0]), "{lookups:?}");
-        assert!(
-            lookups[1].ours.fetched > lookups[0].ours.fetched,
+        assert_eq!(
+            lookups[1].ours.fetched, lookups[0].ours.fetched,
             "{lookups:?}"
         );
-        assert!(lookups[1].ours.total > lookups[0].ours.total, "{lookups:?}");
+        assert!(
+            close(lookups[1].ours.total, lookups[0].ours.total),
+            "{lookups:?}"
+        );
     }
 
     #[pg_test]
@@ -1649,30 +1636,27 @@ pub(crate) mod tests {
         let (theirs, ours, per) = fetched(&inside);
         let touched = inside.ours.pages * inside.ours.sa_scans * inside.loop_count;
         assert!(touched > 10.0 * inside.index_pages, "{inside:?}");
-        assert!(inside.index_pages <= share(&inside), "{inside:?}");
         assert!(ours <= inside.index_pages, "{inside:?}");
         let priced = inside.theirs[1] + (ours * PAGE_IN_MEMORY - theirs * random) / per;
         assert!(close(inside.ours.total, priced), "{inside:?}");
-        // shared buffers of twenty pages, the cache the planner counts: the index holds its part of
-        // them, shared with the statement's tables, and past it the lookups fetch pages first and
-        // again from the disk, counted as the planner counts the pages fetched with that cache
+        // shared buffers of twenty pages, the cache the planner counts: past them, the lookups
+        // fetch pages first and again from the disk, counted as the planner counts the pages
+        // fetched with twenty pages held
         let shared = 20.0;
         let past = lookup(Some(shared));
         assert_eq!(past.cache, shared, "{past:?}");
+        assert_eq!(share(&past), shared, "{past:?}");
         let (theirs, ours, per) = fetched(&past);
-        let held = share(&past);
-        assert!(held < shared, "{held} held");
-        let from_disk = ours - held;
+        let from_disk = ours - shared;
         assert!(from_disk > 10.0 * shared, "{from_disk} from the disk");
         let priced =
-            past.theirs[1] + (held * PAGE_IN_MEMORY + from_disk * random - theirs * random) / per;
+            past.theirs[1] + (shared * PAGE_IN_MEMORY + from_disk * random - theirs * random) / per;
         assert!(close(past.ours.total, priced), "{past:?}");
         assert!(past.ours.total > inside.ours.total, "{past:?} {inside:?}");
     }
 
     #[pg_test]
-    fn repeated_scans_fetch_the_pages_the_planner_counts_with_the_statements_tables_sharing_the_cache(
-    ) {
+    fn repeated_scans_fetch_the_pages_the_planner_counts_with_the_index_alone_in_the_cache() {
         stock();
         ledger();
         let mut questions = questions();
@@ -1701,8 +1685,8 @@ pub(crate) mod tests {
                 }
             }
         }
-        // repeated scans of indexes that fit their part of the cache and of indexes that do not,
-        // among them counts made from other pages touched than the B-tree's own
+        // repeated scans of indexes that fit the cache and of indexes that do not, among them
+        // counts the planner makes otherwise with the statement's tables sharing the cache
         assert!(
             fits > 0 && exceeds > 0 && differs > 0,
             "{fits} {exceeds} {differs}"

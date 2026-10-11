@@ -325,9 +325,9 @@ and its share:
   `warren_surveyor_pg.walked_leaf_page_cost` where that is set, else at the tablespace's
   `seq_page_cost` where they follow one another on the disk and `random_page_cost` where they do
   not;
-- repeated scans (the inner side of a loop) count their pages fetched again with the index's part
-  of shared buffers as the cache they stay in, shared with the statement's tables by their pages as
-  PostgreSQL shares its cache, at `random_page_cost`.
+- repeated scans (the inner side of a loop) count their pages fetched again with the index's own
+  pages, up to the whole of the cache the planner counts (`shared_buffers`, or a lesser
+  `effective_cache_size`), as the cache they stay in, at `random_page_cost`.
 
 **Where it stops.** The pass over the headers draws nothing on the budget. The read of the leaves'
 order draws on it; where the budget leaves no page for it, the leaves are priced as following one
