@@ -241,9 +241,10 @@ that already holds `results/` or `leaves/`, before it writes anything into it.
   user, the server's settings (`setting.*`), the database's locale (`database.*`), the
   extensions and their versions, the sha256 of each library its sessions preload (read where the
   server is on this machine), the `EXPLAIN` it is sent, the table's partitioning, sizes and
-  statistics dates, a fingerprint of every index of the database (`roster`), and under a set the
-  set and the indexes it turns off (`index_set`, `indexes_off`). A fingerprint of all of it but the
-  bench's own session settings, `config_id`, is on every results line.
+  statistics dates, a fingerprint of every index of the database (`roster`), whether the timed
+  session is sent the plan it runs each question by, and why not where it is not (`timed_plan`),
+  and under a set the set and the indexes it turns off (`index_set`, `indexes_off`). A fingerprint
+  of all of it but the bench's own session settings, `config_id`, is on every results line.
 - `indexes.parquet`: every index of the database's own schemas, for every target under each index
   set it ran (`index_set`, empty without one): its table, method, key parts, `INCLUDE` columns,
   predicate, constraint, whether it has an expression, whether it is valid, its size, and whether
@@ -274,6 +275,8 @@ that already holds `results/` or `leaves/`, before it writes anything into it.
     `plan_other_rows_read`), whether execution and its EXPLAIN agree (`rows_read_agree`,
     `leaves_agree`, `leaves_disagreement`), and the relations each read beyond the leaves
     (`witness_other_relations`, `plan_other_relations`, `explain_other_relations`);
+  - the plan timed (below): whether the EXPLAIN planned another tree than the timed execution ran
+    by (`plan_moved`), and where it did, both plans as JSON (`timed_plan`, `explain_plan`);
   - `error`.
 - `leaves/`: one file per question, one line per scan node of each target's first EXPLAIN of the
   question: its place in the plan (`node`), its type, schema, relation and index (a bitmap heap
@@ -319,17 +322,32 @@ needs its EXPLAIN to return the same number of rows. A timing counts only with a
 per-table counters around the timed statement itself, and around a plan-only EXPLAIN to take off
 what planning read. The rows the execution read must equal those its EXPLAIN reports, within the
 rounding of EXPLAIN's per-loop figures, and the leaves each scanned must agree; a repetition that
-breaks this sets the exit status to 4. The witness needs PostgreSQL 15 or later with `track_counts`
-on, and is asked only of readings that settled with no other session connected to the database;
-the bench logs how many repetitions it was not asked of, and why.
+breaks this, where its EXPLAIN planned the same tree as the timed execution ran by (below), sets the
+exit status to 4. The witness needs PostgreSQL 15 or later with `track_counts` on, and is asked only
+of readings that settled with no other session connected to the database; the bench logs how many
+repetitions it was not asked of, and why.
+
+**The plan timed.** The timed session is sent the plan the server ran its question by, as the
+question ends, by PostgreSQL's `auto_explain`, with nothing counted per node, so the run timed is
+not slowed by counting. The EXPLAIN in the other session plans again, and what the timed run brought
+into shared buffers can lead it to another plan. So the bench compares the two plans as trees: what
+each node is, what it reads and by which index, how it joins, groups or scans, and its conditions,
+never its costs or rows. Where they are the same tree, the rows witness is asked as above. Where the
+EXPLAIN planned another, the repetition records that the plan moved (`plan_moved`), with both
+plans, and its rows are not compared, since the EXPLAIN's are another plan's; the bench lists each
+such repetition with where its two plans part, and it changes no exit status. The timed session
+loads `auto_explain` and sets its settings, which a superuser may, or a role whose sessions preload
+it and, from PostgreSQL 15, are granted SET on its settings. Where it cannot, `timed_plan` in
+`targets.parquet` says why, and the rows witness is asked of every repetition.
 
 ## Exit status
 
 `0` every answer RIGHT; `1` some answer WRONG; `2` refused, or stopped by an error; `3` no WRONG
 answer, but some repetition timed out, was cancelled, failed, did not run or had its EXPLAIN fail,
 or the run stopped early, for the generator, a change in the committed indexes or a sample's lock;
-`4` every answer RIGHT, but an execution and its EXPLAIN disagree on the rows read or the leaves
-scanned; `5` no WRONG answer, but a scan used an index its set turned off; `130` interrupted.
+`4` every answer RIGHT, but an execution and its EXPLAIN, planned as the same tree, disagree on the
+rows read or the leaves scanned; `5` no WRONG answer, but a scan used an index its set turned off;
+`130` interrupted. A plan that moved between the two changes none of these.
 `check` exits with `0`, `1`, `2`, `3` or `130`; `summarize` with `0` to `4`, for the results it
 reads; `truth`, `compose`, `export`, `import` and `kit` with `0` or `2`.
 
@@ -347,9 +365,10 @@ BLOCKER_DB_URL=postgres://USER@localhost:5432/postgres \
 ```
 
 They need a superuser's URL, the server on this machine (they read its backends' memory), and
-`warren_surveyor_pg` installed on it. Each makes a small database of its own and drops it when it
-ends: `warren_bench_sets_check`, with small `lego` tables, a class hierarchy of their sets and a
-surveyor on each, or `warren_bench_check`, with one table of the types an answer's digest reads.
+`warren_surveyor_pg` and `auto_explain` installed on it. Each makes a small database of its own and
+drops it when it ends: `warren_bench_sets_check`, with small `lego` tables, a class hierarchy of
+their sets and a surveyor on each, or `warren_bench_check`, with one table of the types an answer's
+digest reads.
 
 ## Licence
 

@@ -16,14 +16,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::PgConnection;
+use tracing_subscriber::prelude::*;
 
 use crate::digest::Digest;
+use crate::explain;
+use crate::notice;
 use crate::questions::{Question, QuestionSet};
 use crate::report::RESULTS;
 use crate::run::{self, Ctx, Live, Plan, Spec, Statements, Status};
 use crate::tables::{self, Value};
-use crate::target::{self, Session, Url};
+use crate::target::{self, PlanSent, Session, Url};
 use crate::watchdog::Guard;
+use crate::witness;
+
+/// The program's layer that catches the server's notices, for this thread while the guard lives.
+fn catching_notices() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(tracing_subscriber::registry().with(notice::layer()))
+}
 
 const DB: &str = "warren_bench_check";
 
@@ -292,6 +301,7 @@ async fn a_question_set_answers_right_and_a_changed_value_is_wrong() {
 #[ignore]
 async fn a_run_writes_its_declared_columns() {
     let _one = one_at_a_time();
+    let _log = catching_notices();
     let db = fixture().await;
     let dir = scratch("run");
     let set = questions(&dir);
@@ -330,6 +340,10 @@ async fn a_run_writes_its_declared_columns() {
         assert!(matches!(r[col("execution_ms")], Value::Float(_)));
         assert!(matches!(r[col("planning_ms")], Value::Float(_)));
         assert!(matches!(r[col("rows")], Value::Int(_)));
+        // each repetition's timed plan came, and the EXPLAIN planned the same tree
+        assert_eq!(r[col("plan_moved")], Value::Bool(false), "{r:?}");
+        assert_eq!(r[col("timed_plan")], Value::Null, "{r:?}");
+        assert_eq!(r[col("explain_plan")], Value::Null, "{r:?}");
     }
     let value = |t: &str, k: &str| {
         targets
@@ -342,6 +356,10 @@ async fn a_run_writes_its_declared_columns() {
         value("pg", "setting.server_version_num"),
         Value::Text(_)
     ));
+    match value("pg", "timed_plan") {
+        Value::Text(t) => assert!(t.starts_with("auto_explain"), "{t}"),
+        v => panic!("{v:?}"),
+    }
 
     // the text export of the results reads back to the same values
     let text = tables::to_tsv(&RESULTS, results.clone()).unwrap();
@@ -352,5 +370,166 @@ async fn a_run_writes_its_declared_columns() {
         l.control.close().await;
     }
     fs::remove_dir_all(&dir).unwrap();
+    cleanup().await;
+}
+
+/// The statements of `sql` on the timed session, inside the transaction a repetition opens.
+fn timed_statements(sql: &str, version: u32) -> Statements {
+    Statements {
+        open: vec!["BEGIN".into(), run::READ_ONLY.into()],
+        close: vec!["ROLLBACK".into()],
+        show_plan: vec![run::SHOW_PLAN.into()],
+        ..run::statements(&plain("q/timed"), sql, explain::command(version))
+    }
+}
+
+async fn version(url: &Url) -> u32 {
+    let mut s = session(url, "60s").await;
+    let v = target::scalar(&mut s.conn, "SHOW server_version_num")
+        .await
+        .unwrap()
+        .unwrap();
+    s.close().await;
+    v.parse().unwrap()
+}
+
+/// A timed session on `url` as the bench opens one for a target the server sends its plan.
+async fn timed_session(url: &Url, sent: &PlanSent) -> Session {
+    let mut s = session(url, "60s").await;
+    if *sent == PlanSent::Loaded {
+        exec(&mut s.conn, run::LOAD_PLAN).await;
+    }
+    s
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_timed_run_keeps_its_own_plan_among_the_plans_its_session_is_sent() {
+    let _one = one_at_a_time();
+    let _log = catching_notices();
+    let db = fixture().await;
+    let v = version(&db).await;
+    // a function the planner evaluates while the question is planned is sent its own plan first
+    let mut c = session(&db, "60s").await;
+    exec(
+        &mut c.conn,
+        "CREATE FUNCTION law_first(integer) RETURNS integer LANGUAGE sql IMMUTABLE
+         AS $$ SELECT min(x) FROM (VALUES ($1)) v(x) $$",
+    )
+    .await;
+    c.close().await;
+    let sent = run::plan_sent(&db.session_options().unwrap(), "60s").await;
+    assert!(
+        matches!(sent, PlanSent::Loaded | PlanSent::Preloaded),
+        "{sent:?}"
+    );
+    let sql = "SELECT id FROM law WHERE id = law_first(2)";
+    let mut s = timed_session(&db, &sent).await;
+    exec(&mut s.conn, "BEGIN").await;
+    exec(&mut s.conn, run::SHOW_PLAN).await;
+    let (ran, notices) = notice::catch(target::simple(&mut s.conn, sql)).await;
+    ran.unwrap();
+    exec(&mut s.conn, "ROLLBACK").await;
+    let plans = notices.iter().filter(|n| n.contains("\"Plan\"")).count();
+    assert!(plans >= 2, "{notices:#?}");
+
+    // the timed run keeps the question's own
+    let mut control = session(&db, "30s").await;
+    let st = timed_statements(sql, v);
+    let t = run::run_timed(&mut control.conn, &mut s, &guard(u64::MAX), &st).await;
+    assert_eq!(t.status, Status::Ok, "{}", t.error);
+    let p = t.plan.expect("asked for").expect("sent");
+    assert_eq!(p["Node Type"], "Seq Scan", "{p}");
+    assert_eq!(p["Relation Name"], "law", "{p}");
+    // and nothing the session runs after its transaction is explained
+    let (flushed, after) = notice::catch(witness::flush(&mut s.conn)).await;
+    flushed.unwrap();
+    assert!(after.is_empty(), "{after:#?}");
+    s.close().await;
+    control.close().await;
+    cleanup().await;
+}
+
+/// The timed run of `st` in a session that first ran `timed_set`, and its EXPLAIN in another that
+/// first ran `explain_set`.
+async fn both_ways(
+    url: &Url,
+    sent: &PlanSent,
+    st: &Statements,
+    version: u32,
+    timed_set: &str,
+    explain_set: &str,
+) -> (run::Timed, run::Explained) {
+    let g = guard(u64::MAX);
+    let mut control = session(url, "30s").await;
+    let mut a = timed_session(url, sent).await;
+    exec(&mut a.conn, timed_set).await;
+    let t = run::run_timed(&mut control.conn, &mut a, &g, st).await;
+    let mut b = session(url, "60s").await;
+    exec(&mut b.conn, explain_set).await;
+    let e = run::run_explain(&mut control.conn, &mut b, &g, st, &BTreeSet::new(), version).await;
+    a.close().await;
+    b.close().await;
+    control.close().await;
+    assert_eq!(t.status, Status::Ok, "{}", t.error);
+    assert_eq!(e.status, Status::Ok, "{}", e.error);
+    (t, e)
+}
+
+#[tokio::test]
+#[ignore]
+async fn one_plan_compares_alike_from_both_sessions_and_a_plan_made_otherwise_has_moved() {
+    let _one = one_at_a_time();
+    let _log = catching_notices();
+    let db = fixture().await;
+    let v = version(&db).await;
+    let sent = run::plan_sent(&db.session_options().unwrap(), "60s").await;
+    let sql = "SELECT a.name, count(*) AS n FROM law a JOIN law b ON b.id = a.id
+               WHERE a.flag IS NOT NULL GROUP BY a.name ORDER BY a.name";
+    let st = timed_statements(sql, v);
+    let plans = |t: &run::Timed, e: &run::Explained| {
+        let p = t.plan.clone().unwrap().unwrap();
+        let f = e.facts.as_ref().unwrap();
+        (explain::parting(&p, &f.plan), p, f.plan.clone())
+    };
+
+    // planned alike: the plan sent as the statement ends and the EXPLAIN ANALYZE are one tree
+    let (t, e) = both_ways(&db, &sent, &st, v, "RESET ALL", "RESET ALL").await;
+    let (part, p, f) = plans(&t, &e);
+    assert_eq!(
+        run::moved(Some(&t), Some(&e)),
+        Some(false),
+        "{part:?}\n{p}\n{f}"
+    );
+    // also with a WITH query, an InitPlan and parallel workers, which the EXPLAIN ANALYZE reports
+    // per worker
+    let parallel = "SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0;
+                    SET min_parallel_table_scan_size = 0; SET max_parallel_workers_per_gather = 2";
+    let sql = "WITH m AS MATERIALIZED (SELECT id, name FROM law)
+               SELECT m.name, count(*) AS n FROM m JOIN law b ON b.id = m.id
+               WHERE b.id >= (SELECT min(id) FROM law) GROUP BY m.name";
+    let wide = timed_statements(sql, v);
+    let (t, e) = both_ways(&db, &sent, &wide, v, parallel, parallel).await;
+    let (part, p, f) = plans(&t, &e);
+    assert!(f.to_string().contains("Workers Planned"), "{f}");
+    assert_eq!(
+        run::moved(Some(&t), Some(&e)),
+        Some(false),
+        "{part:?}\n{p}\n{f}"
+    );
+
+    // planned otherwise: the timed session may not sort, the EXPLAIN's may not hash
+    let (t, e) = both_ways(
+        &db,
+        &sent,
+        &st,
+        v,
+        "SET enable_sort = off",
+        "SET enable_hashagg = off",
+    )
+    .await;
+    let (part, p, f) = plans(&t, &e);
+    assert_eq!(run::moved(Some(&t), Some(&e)), Some(true), "{p}\n{f}");
+    assert!(part.is_some());
     cleanup().await;
 }

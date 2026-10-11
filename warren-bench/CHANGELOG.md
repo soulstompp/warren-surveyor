@@ -17,6 +17,12 @@
   with the relations they compose in `suite/relations`, read with `--search-path`.
 - The kit's `surveyor.sql` says that a role granted SET on `session_preload_libraries` may set it
   from PostgreSQL 15.
+- The timed session is sent the plan the server ran its question by, through `auto_explain` with
+  nothing counted per node, and the rows witness is asked only where the EXPLAIN planned the same
+  tree. Where the EXPLAIN planned another, the results say the plan moved (`plan_moved`, both plans
+  in `timed_plan` and `explain_plan`), the run lists each such repetition, and none sets exit
+  status 4. `targets.parquet` says whether the plan is sent (`timed_plan`), and results written
+  before read as they were recorded.
 
 ## 0.1.0
 

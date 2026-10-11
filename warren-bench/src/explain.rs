@@ -4,7 +4,8 @@
 //! What one `EXPLAIN (ANALYZE, BUFFERS, SUMMARY, MEMORY, VERBOSE, FORMAT JSON)` reports: times,
 //! rows, buffers, planner memory, and every relation a plan node scans, with its schema and the
 //! index it used. MEMORY is sent only to a server that has it (see `command`), and a figure the
-//! EXPLAIN did not report is read as absent, never as zero.
+//! EXPLAIN did not report is read as absent, never as zero. Also the plan the timed session's
+//! execution sends as a notice, and whether two plans are the same tree.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,6 +94,8 @@ pub struct Facts {
     /// Subplans removed at executor start, over every node.
     pub subplans_removed: Option<u64>,
     pub scans: Vec<Scan>,
+    /// The plan as the EXPLAIN printed it.
+    pub plan: Value,
 }
 
 fn num(v: &Value, key: &str) -> f64 {
@@ -145,6 +148,7 @@ pub fn parse(text: &str, server_version_num: u32) -> Result<Facts, String> {
             .and_then(Value::as_f64),
         workers_launched: Some(0),
         subplans_removed: Some(0),
+        plan: plan.clone(),
         ..Facts::default()
     };
     walk(plan, server_version_num, &mut f);
@@ -320,6 +324,167 @@ pub fn leaves(facts: &Facts, target_leaves: &BTreeSet<String>) -> Leaves {
         .map(|(r, _)| r.to_string())
         .collect();
     l
+}
+
+/// Whether a notice carries a plan: a first line, then a JSON object.
+fn carries_plan(notice: &str) -> bool {
+    notice
+        .split_once('\n')
+        .is_some_and(|(_, rest)| rest.starts_with('{'))
+}
+
+/// The plan of the statement a session ran, from the notices the server sent it while the statement
+/// ran. The statement's own plan is sent as it ends, after any plan of a function evaluated while it
+/// was planned, so it is the last notice that carries one.
+pub fn timed_plan(notices: &[String]) -> Result<Value, String> {
+    let last = notices
+        .iter()
+        .rev()
+        .find(|n| carries_plan(n))
+        .ok_or_else(|| {
+            format!(
+                "none of the {} notices the statement brought carries a plan",
+                notices.len()
+            )
+        })?;
+    let (_, json) = last.split_once('\n').unwrap_or_default();
+    let doc: Value = serde_json::from_str(json)
+        .map_err(|e| format!("the statement's plan cannot be read: {e}"))?;
+    doc.get("Plan")
+        .cloned()
+        .ok_or_else(|| "the statement's plan cannot be read: it holds no Plan".to_string())
+}
+
+/// What makes two plans the same tree, node by node: what the node is, what it reads and by which
+/// index, how it joins, groups or scans, its conditions and keys, and its children in order. Costs,
+/// estimates and everything counted while it ran are left out, since they move while the plan stays.
+const TREE: &[&str] = &[
+    "Node Type",
+    "Parent Relationship",
+    "Subplan Name",
+    "Custom Plan Provider",
+    "Relation Name",
+    "Schema",
+    "Alias",
+    "Index Name",
+    "Function Name",
+    "Table Function Name",
+    "CTE Name",
+    "Tuplestore Name",
+    "Strategy",
+    "Partial Mode",
+    "Operation",
+    "Command",
+    "Join Type",
+    "Inner Unique",
+    "Scan Direction",
+    "Parallel Aware",
+    "Async Capable",
+    "Single Copy",
+    "Workers Planned",
+    "Cache Mode",
+    "Sampling Method",
+    "Index Cond",
+    "Recheck Cond",
+    "TID Cond",
+    "Filter",
+    "Join Filter",
+    "Hash Cond",
+    "Merge Cond",
+    "One-Time Filter",
+    "Order By",
+    "Run Condition",
+    "Sort Key",
+    "Presorted Key",
+    "Group Key",
+    "Grouping Sets",
+    "Cache Key",
+    "Window",
+];
+
+fn children(node: &Value) -> &[Value] {
+    node.get("Plans")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// One node's own part of the tree, its children left out.
+fn own(node: &Value) -> serde_json::Map<String, Value> {
+    TREE.iter()
+        .filter_map(|k| node.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect()
+}
+
+/// A plan reduced to its tree.
+pub fn tree(plan: &Value) -> Value {
+    let mut out = own(plan);
+    let kids: Vec<Value> = children(plan).iter().map(tree).collect();
+    if !kids.is_empty() {
+        out.insert("Plans".into(), Value::Array(kids));
+    }
+    Value::Object(out)
+}
+
+/// Whether two plans are the same tree.
+pub fn same_tree(a: &Value, b: &Value) -> bool {
+    tree(a) == tree(b)
+}
+
+/// A node as EXPLAIN's text names it: its type, its index, and what it reads.
+fn label(node: &Value) -> String {
+    let s = |k: &str| node.get(k).and_then(Value::as_str);
+    let mut l = s("Node Type").unwrap_or("?").to_string();
+    if let Some(ix) = s("Index Name") {
+        l.push_str(&format!(" using {ix}"));
+    }
+    if let Some(rel) = s("Relation Name") {
+        l.push_str(" on ");
+        if let Some(schema) = s("Schema") {
+            l.push_str(&format!("{schema}."));
+        }
+        l.push_str(rel);
+        if let Some(alias) = s("Alias").filter(|a| *a != rel) {
+            l.push_str(&format!(" {alias}"));
+        }
+    } else if let Some(name) = s("CTE Name").or(s("Function Name")) {
+        l.push_str(&format!(" on {name}"));
+    }
+    l
+}
+
+/// Where the timed execution's plan `timed` and its EXPLAIN's `explain` part: the first node, depth
+/// first and counted from 1, that is not the same both ways. `None` when they are the same tree.
+pub fn parting(timed: &Value, explain: &Value) -> Option<String> {
+    fn walk(a: &Value, b: &Value, n: &mut u64) -> Option<String> {
+        *n += 1;
+        let (oa, ob) = (own(a), own(b));
+        let (ka, kb) = (children(a), children(b));
+        if oa != ob || ka.len() != kb.len() {
+            let (la, lb) = (label(a), label(b));
+            if la != lb {
+                return Some(format!(
+                    "at node {n}, {la} in the timed execution and {lb} in its EXPLAIN"
+                ));
+            }
+            let mut differ: Vec<&str> = TREE
+                .iter()
+                .copied()
+                .filter(|k| oa.get(*k) != ob.get(*k))
+                .collect();
+            if ka.len() != kb.len() {
+                differ.push("children");
+            }
+            let which = match differ.as_slice() {
+                [one] if *one == "children" => "children differ".to_string(),
+                [one] => format!("{one} differs"),
+                more => format!("{} differ", more.join(", ")),
+            };
+            return Some(format!("at node {n}, {la} both ways, whose {which}"));
+        }
+        ka.iter().zip(kb).find_map(|(x, y)| walk(x, y, n))
+    }
+    walk(timed, explain, &mut 0)
 }
 
 #[cfg(test)]
@@ -559,5 +724,169 @@ mod tests {
     fn refuses_output_that_is_not_a_plan() {
         assert!(parse("[]", V18).is_err());
         assert!(parse("not json", V18).is_err());
+    }
+
+    // One plan as PostgreSQL 18 prints it under EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON),
+    // cut to a few of its fields, and the same plan as the timed session's notice brings it, with
+    // nothing counted per node: other costs, no actual figures.
+    const EXPLAINED: &str = r#"[{"Plan": {"Node Type": "Hash Join", "Parallel Aware": false,
+        "Async Capable": false, "Join Type": "Inner", "Startup Cost": 1020.50, "Total Cost": 1431.13,
+        "Plan Rows": 1672, "Plan Width": 8, "Actual Startup Time": 4.1, "Actual Total Time": 6.2,
+        "Actual Rows": 1672.00, "Actual Loops": 1, "Output": ["i.set_num"], "Inner Unique": true,
+        "Hash Cond": "(s.inventory_id = i.id)", "Shared Hit Blocks": 186, "Shared Read Blocks": 0,
+        "Disabled": false,
+        "Plans": [
+          {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Parallel Aware": false,
+           "Async Capable": false, "Relation Name": "lego_inventory_sets", "Schema": "lego",
+           "Alias": "s", "Total Cost": 30.00, "Plan Rows": 1672, "Actual Rows": 1672.00,
+           "Actual Loops": 1, "Output": ["s.inventory_id"], "Shared Hit Blocks": 12},
+          {"Node Type": "Hash", "Parent Relationship": "Inner", "Parallel Aware": false,
+           "Async Capable": false, "Total Cost": 431.13, "Plan Rows": 31687, "Actual Rows": 31669.00,
+           "Actual Loops": 1, "Hash Buckets": 32768, "Peak Memory Usage": 1641,
+           "Output": ["i.set_num", "i.id"],
+           "Plans": [
+             {"Node Type": "Index Only Scan", "Parent Relationship": "Outer", "Parallel Aware": false,
+              "Async Capable": false, "Scan Direction": "Forward",
+              "Index Name": "lego_inventories_set_num_version_id_idx",
+              "Relation Name": "lego_inventories", "Schema": "lego", "Alias": "i",
+              "Total Cost": 431.13, "Plan Rows": 31669, "Actual Rows": 31669.00, "Actual Loops": 1,
+              "Output": ["i.set_num", "i.id"], "Filter": "(i.version = 1)",
+              "Rows Removed by Filter": 18, "Heap Fetches": 0, "Index Searches": 1,
+              "Shared Hit Blocks": 174}]}]},
+      "Planning": {"Shared Hit Blocks": 40}, "Planning Time": 0.9, "Execution Time": 6.4}]"#;
+
+    const TIMED: &str = r#"duration: 6.204 ms  plan:
+{
+  "Query Text": "SELECT i.set_num FROM lego_inventories i JOIN lego_inventory_sets s ON s.inventory_id = i.id WHERE i.version = 1",
+  "Plan": {"Node Type": "Hash Join", "Parallel Aware": false, "Async Capable": false,
+    "Join Type": "Inner", "Startup Cost": 1163.47, "Total Cost": 1574.10, "Plan Rows": 1672,
+    "Plan Width": 8, "Output": ["i.set_num"], "Inner Unique": true,
+    "Hash Cond": "(s.inventory_id = i.id)", "Disabled": false,
+    "Plans": [
+      {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Parallel Aware": false,
+       "Async Capable": false, "Relation Name": "lego_inventory_sets", "Schema": "lego", "Alias": "s",
+       "Total Cost": 30.00, "Plan Rows": 1672, "Output": ["s.inventory_id"]},
+      {"Node Type": "Hash", "Parent Relationship": "Inner", "Parallel Aware": false,
+       "Async Capable": false, "Total Cost": 574.10, "Plan Rows": 31687,
+       "Output": ["i.set_num", "i.id"],
+       "Plans": [
+         {"Node Type": "Index Only Scan", "Parent Relationship": "Outer", "Parallel Aware": false,
+          "Async Capable": false, "Scan Direction": "Forward",
+          "Index Name": "lego_inventories_set_num_version_id_idx",
+          "Relation Name": "lego_inventories", "Schema": "lego", "Alias": "i",
+          "Total Cost": 574.10, "Plan Rows": 31669, "Output": ["i.set_num", "i.id"],
+          "Filter": "(i.version = 1)"}]}]}
+}"#;
+
+    /// What an SQL function evaluated while the question was planned brings first.
+    const WHILE_PLANNING: &str = "duration: 0.004 ms  plan:\n{\n  \"Query Text\": \"\",\n  \"Plan\": {\"Node Type\": \"Result\", \"Parallel Aware\": false, \"Async Capable\": false}\n}";
+
+    fn explained() -> Value {
+        parse(EXPLAINED, V18).unwrap().plan
+    }
+
+    fn timed() -> Value {
+        timed_plan(&[TIMED.to_string()]).unwrap()
+    }
+
+    /// The timed plan with the node at `path` (child indexes from the top) changed by `f`.
+    fn changed(path: &[usize], f: impl Fn(&mut serde_json::Map<String, Value>)) -> Value {
+        let mut p = timed();
+        let mut n = &mut p;
+        for i in path {
+            n = &mut n["Plans"][*i];
+        }
+        f(n.as_object_mut().unwrap());
+        p
+    }
+
+    #[test]
+    fn the_timed_plan_is_the_last_plan_its_notices_bring() {
+        let notices = [
+            WHILE_PLANNING.to_string(),
+            "a notice that is no plan".to_string(),
+            TIMED.to_string(),
+        ];
+        let p = timed_plan(&notices).unwrap();
+        assert_eq!(p["Node Type"], "Hash Join");
+        assert_eq!(p["Plans"][1]["Plans"][0]["Node Type"], "Index Only Scan");
+        assert!(timed_plan(&[]).is_err());
+        assert!(timed_plan(&["a notice that is no plan".to_string()]).is_err());
+        // a last plan that cannot be read is never taken for an earlier one
+        let broken = "duration: 6.204 ms  plan:\n{\n  \"Query Text\": \"SELECT";
+        let e = timed_plan(&[TIMED.to_string(), broken.to_string()]).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+    }
+
+    #[test]
+    fn one_plan_read_from_either_session_is_the_same_tree_whatever_its_costs_and_counts() {
+        assert!(same_tree(&timed(), &explained()));
+        assert_eq!(parting(&timed(), &explained()), None);
+        let t = tree(&explained());
+        let text = t.to_string();
+        for absent in [
+            "Cost",
+            "Rows",
+            "Actual",
+            "Blocks",
+            "Buckets",
+            "Output",
+            "Heap Fetches",
+        ] {
+            assert!(!text.contains(absent), "{absent} in {text}");
+        }
+        assert_eq!(
+            t["Plans"][1]["Plans"][0]["Index Name"],
+            "lego_inventories_set_num_version_id_idx"
+        );
+    }
+
+    #[test]
+    fn another_scan_is_another_tree_and_named_where_the_plans_part() {
+        let seq = changed(&[1, 0], |n| {
+            n.insert("Node Type".into(), "Seq Scan".into());
+            n.remove("Index Name");
+            n.remove("Scan Direction");
+        });
+        assert!(!same_tree(&seq, &explained()));
+        assert_eq!(
+            parting(&seq, &explained()).unwrap(),
+            "at node 4, Seq Scan on lego.lego_inventories i in the timed execution and Index Only \
+             Scan using lego_inventories_set_num_version_id_idx on lego.lego_inventories i in its \
+             EXPLAIN"
+        );
+    }
+
+    #[test]
+    fn another_join_another_condition_or_another_order_is_another_tree() {
+        let left = changed(&[], |n| {
+            n.insert("Join Type".into(), "Left".into());
+        });
+        assert!(!same_tree(&left, &explained()));
+        assert_eq!(
+            parting(&left, &explained()).unwrap(),
+            "at node 1, Hash Join both ways, whose Join Type differs"
+        );
+        let cond = changed(&[], |n| {
+            n.insert("Hash Cond".into(), "(s.set_num = i.set_num)".into());
+        });
+        assert!(!same_tree(&cond, &explained()));
+        let filter = changed(&[1, 0], |n| {
+            n.remove("Filter");
+        });
+        assert!(!same_tree(&filter, &explained()));
+        let swapped = changed(&[], |n| {
+            if let Some(Value::Array(c)) = n.get_mut("Plans") {
+                c.reverse();
+            }
+        });
+        assert!(!same_tree(&swapped, &explained()));
+        let fewer = changed(&[1], |n| {
+            n.remove("Plans");
+        });
+        assert_eq!(
+            parting(&fewer, &explained()).unwrap(),
+            "at node 3, Hash both ways, whose children differ"
+        );
     }
 }

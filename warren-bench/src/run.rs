@@ -20,10 +20,11 @@ use crate::derived::{self, Family};
 use crate::digest::{fingerprint, Digest, RowBuffer};
 use crate::explain::{self, Facts, Leaves};
 use crate::index_sets::{self, Resolved};
+use crate::notice;
 use crate::questions::{compose, differs_beyond_table, literal, Composed, Question, QuestionSet};
 use crate::report::RESULTS;
 use crate::tables::{self, Declared, Kind};
-use crate::target::{self, Session, Target, Url};
+use crate::target::{self, PlanSent, Session, Target, Url};
 use crate::watchdog::{self, watch, Guard, Watched, INTERRUPTED};
 use crate::witness::{self, Reading, Split};
 
@@ -239,6 +240,12 @@ async fn resolve_targets(
             }
             let explain = explain::command(version);
             config.push(("explain".into(), explain.into()));
+            let plan = plan_sent(&session_options(&url, ctx)?, &ctx.statement_timeout).await;
+            match &plan {
+                PlanSent::Not(why) => warn!(why = %why, "the server does not send the timed session the plan it runs each question by: the rows witness reads the EXPLAIN's plan alone"),
+                sent => info!(timed_plan = %sent.word(), "the timed session gets the plan it runs each question by"),
+            }
+            config.push(("timed_plan".into(), plan.word()));
             let work = ctx.work.join(slug(&format!("{}__{}", url.database, name)));
             let composed = compose(set, &table, &work)?;
             refuse_unless_one_query(&mut control.conn, &composed.sql).await?;
@@ -253,6 +260,7 @@ async fn resolve_targets(
                 explain,
                 config,
                 config_id,
+                plan,
             };
             let settings: Vec<String> = t
                 .config
@@ -374,6 +382,9 @@ pub struct Statements {
     /// turns off, then `READ_ONLY`. A failure here fails the repetition as an ERROR before the
     /// question.
     pub open: Vec<String>,
+    /// Sent after `open` on the timed session only, untimed: from here until the transaction ends,
+    /// the server sends the session the plan it executes the question by (see `SHOW_PLAN`).
+    pub show_plan: Vec<String>,
     /// Sent first on every path out once `open` has been sent (`ROLLBACK`), before any
     /// deallocation. A session where it fails is dropped.
     pub close: Vec<String>,
@@ -400,6 +411,7 @@ pub fn statements(q: &Question, sql: &str, explain: &str) -> Statements {
     if q.binds.is_empty() {
         Statements {
             open: vec![],
+            show_plan: vec![],
             close: vec![],
             prepare: vec![],
             run: sql.to_string(),
@@ -416,6 +428,7 @@ pub fn statements(q: &Question, sql: &str, explain: &str) -> Statements {
         let deallocate = vec![format!("DEALLOCATE {PREPARED}")];
         Statements {
             open: vec![],
+            show_plan: vec![],
             close: vec![],
             explain_prepare: prepare.clone(),
             explain: format!("{explain} {exec}"),
@@ -443,6 +456,88 @@ pub fn statements_for(live: &Live, q: &Question) -> Statements {
     };
     open.push(READ_ONLY.to_string());
     Statements { open, close, ..st }
+}
+
+/// Loads the module that sends the timed session its plan: once, when the session opens, so that
+/// no repetition pays for it.
+pub const LOAD_PLAN: &str = "LOAD 'auto_explain'";
+
+/// Until the repetition's transaction ends, the server sends the session the plan of each statement
+/// it runs, as a notice when the statement ends: the plan alone, with nothing counted per node, so
+/// the execution timed is not slowed; VERBOSE, as the EXPLAIN is, so the two plans compare; and of
+/// every statement, never a sample.
+pub const SHOW_PLAN: &str = "SET LOCAL auto_explain.log_min_duration = 0; \
+    SET LOCAL auto_explain.log_analyze = off; \
+    SET LOCAL auto_explain.log_verbose = on; \
+    SET LOCAL auto_explain.log_format = json; \
+    SET LOCAL auto_explain.log_level = notice; \
+    SET LOCAL auto_explain.log_nested_statements = off; \
+    SET LOCAL auto_explain.sample_rate = 1; \
+    SET LOCAL client_min_messages = notice";
+
+/// The statements for question `q` on the timed session of a target the server sends its plan.
+pub fn timed_statements(live: &Live, q: &Question) -> Statements {
+    let show_plan = match live.target.plan {
+        PlanSent::Loaded | PlanSent::Preloaded => vec![SHOW_PLAN.to_string()],
+        PlanSent::Not(_) => vec![],
+    };
+    Statements {
+        show_plan,
+        ..statements_for(live, q)
+    }
+}
+
+/// Whether the server sends a session on `opts` the plan it runs a statement by, and how: tried in
+/// a session of its own, inside a transaction it rolls back, by a statement whose plan must arrive.
+/// Without loading `auto_explain` first, for a server that preloads it; then loading it.
+pub async fn plan_sent(opts: &PgConnectOptions, statement_timeout: &str) -> PlanSent {
+    let mut why = Vec::new();
+    for (load, sent) in [(false, PlanSent::Preloaded), (true, PlanSent::Loaded)] {
+        match try_plan(opts, statement_timeout, load).await {
+            Ok(()) => return sent,
+            Err(e) => why.push(e),
+        }
+    }
+    PlanSent::Not(why.join("; "))
+}
+
+async fn try_plan(
+    opts: &PgConnectOptions,
+    statement_timeout: &str,
+    load: bool,
+) -> Result<(), String> {
+    let mut s = target::open(opts, statement_timeout).await?;
+    let tried = async {
+        let say =
+            |sql: &str, e: sqlx::Error| format!("{}: {e}", sql.split(';').next().unwrap_or(sql));
+        if load {
+            target::simple(&mut s.conn, LOAD_PLAN)
+                .await
+                .map_err(|e| say(LOAD_PLAN, e))?;
+        }
+        for sql in ["BEGIN", SHOW_PLAN] {
+            target::simple(&mut s.conn, sql)
+                .await
+                .map_err(|e| say(sql, e))?;
+        }
+        let (ran, notices) = notice::catch(target::simple(&mut s.conn, "SELECT 1")).await;
+        ran.map_err(|e| say("SELECT 1", e))?;
+        let plan = explain::timed_plan(&notices)?;
+        match plan.get("Node Type").and_then(serde_json::Value::as_str) {
+            Some("Result") => Ok(()),
+            _ => Err(format!("the plan that came is not the statement's: {plan}")),
+        }
+    }
+    .await;
+    let _ = target::simple(&mut s.conn, "ROLLBACK").await;
+    s.close().await;
+    tried.map_err(|e| {
+        if load {
+            e
+        } else {
+            format!("without loading it, {e}")
+        }
+    })
 }
 
 /// Refuses, by its question's name, any statement PostgreSQL does not parse as exactly one
@@ -595,6 +690,9 @@ pub struct Timed {
     pub answer: Option<Digest>,
     pub watched: Watched,
     pub error: String,
+    /// The plan the server executed the statement by, as it sent it, where the statement finished
+    /// and its plan was asked for (see `SHOW_PLAN`); why it is missing, where it is.
+    pub plan: Option<Result<serde_json::Value, String>>,
 }
 
 pub struct Explained {
@@ -629,24 +727,31 @@ pub async fn run_timed(
         answer: None,
         watched: Watched::default(),
         error,
+        plan: None,
     };
-    if let Err((_, error)) = watched_each(control, session, guard, &st.open).await {
-        let closed = close_open(control, session, guard, st).await;
-        return failed(
-            Status::Error,
-            and_closed(format!("before the question: {error}"), closed),
-        );
+    for (before, what) in [
+        (&st.open, "before the question"),
+        (&st.show_plan, "asking for the plan"),
+    ] {
+        if let Err((_, error)) = watched_each(control, session, guard, before).await {
+            let closed = close_open(control, session, guard, st).await;
+            return failed(
+                Status::Error,
+                and_closed(format!("{what}: {error}"), closed),
+            );
+        }
     }
     if let Err((status, error)) = watched_each(control, session, guard, &st.prepare).await {
         let closed = close_open(control, session, guard, st).await;
         return failed(status, and_closed(error, closed));
     }
     let pid = session.pid;
-    let (res, watched) = watch(
+    // the notices are caught on the statement's own polls, never on the control session's
+    let ((res, notices), watched) = watch(
         control,
         pid,
         guard,
-        fetch_answer(&mut session.conn, &st.run),
+        notice::catch(fetch_answer(&mut session.conn, &st.run)),
     )
     .await;
     let out = match res {
@@ -656,6 +761,7 @@ pub async fn run_timed(
             answer: Some(buf.digest()),
             watched,
             error: String::new(),
+            plan: (!st.show_plan.is_empty()).then(|| explain::timed_plan(&notices)),
         },
         Err(e) => {
             let (status, error) = classify(&e, &watched);
@@ -665,6 +771,7 @@ pub async fn run_timed(
                 answer: None,
                 watched,
                 error,
+                plan: None,
             }
         }
     };
@@ -1144,6 +1251,14 @@ fn agreement(w: Option<&Figures>, l: Option<&Leaves>) -> Option<Agreement> {
     })
 }
 
+/// Whether the EXPLAIN's session planned another tree than the one the timed execution ran by;
+/// `None` where either plan is not known.
+pub fn moved(timed: Option<&Timed>, ex: Option<&Explained>) -> Option<bool> {
+    let plan = timed?.plan.as_ref()?.as_ref().ok()?;
+    let explained = &ex?.facts.as_ref()?.plan;
+    Some(!explain::same_tree(plan, explained))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn result_line(
     t: &Target,
@@ -1166,10 +1281,27 @@ fn result_line(
     let f = ex.and_then(|e| e.facts.as_ref());
     let l = ex.and_then(|e| e.leaves.as_ref());
     let w = figures(seen, t);
-    let agree = agreement(w.as_ref(), l);
+    // the rows are compared only where both sessions planned the same tree
+    let moved = moved(timed, ex);
+    let agree = if moved == Some(true) {
+        None
+    } else {
+        agreement(w.as_ref(), l)
+    };
+    let both_plans = match (moved, timed.and_then(|t| t.plan.as_ref()), f) {
+        (Some(true), Some(Ok(p)), Some(f)) => Some((p.to_string(), f.plan.to_string())),
+        _ => None,
+    };
     let mut error = String::new();
     if let Some(t) = timed {
         error.push_str(&t.error);
+        if let Some(Err(e)) = &t.plan {
+            if !error.is_empty() {
+                error.push_str(" | ");
+            }
+            error.push_str("timed plan: ");
+            error.push_str(e);
+        }
     }
     if let Some(e) = ex {
         if !e.error.is_empty() {
@@ -1289,6 +1421,9 @@ fn result_line(
             .unwrap_or_default(),
         l.map(|l| explain::others_text(&l.others))
             .unwrap_or_default(),
+        opt(moved),
+        both_plans.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
+        both_plans.map(|p| p.1).unwrap_or_default(),
         error,
     ];
     debug_assert_eq!(fields.len(), RESULTS.columns.len());
@@ -1359,7 +1494,7 @@ pub async fn bench(
                     error!(lock = %lock.display(), "the lock appeared: stopping the run");
                     return Ok(Some(Ending::StoppedForLock));
                 }
-                let st = statements_for(live, q);
+                let st = timed_statements(live, q);
                 let witnessed = witness::reports(live.target.server_version_num, live.target.get("setting.track_counts"));
                 let mut sessions: Option<(Session, Session)> = None;
                 let mut failed: Option<String> = None;
@@ -1375,7 +1510,12 @@ pub async fn bench(
                             a.close().await;
                             b.close().await;
                         }
-                        let a = target::open(&live.target.opts, &ctx.statement_timeout).await?;
+                        let mut a = target::open(&live.target.opts, &ctx.statement_timeout).await?;
+                        if live.target.plan == PlanSent::Loaded {
+                            target::simple(&mut a.conn, LOAD_PLAN)
+                                .await
+                                .map_err(|e| format!("{LOAD_PLAN}: {e}"))?;
+                        }
                         let b = target::open(&live.target.opts, &ctx.statement_timeout).await?;
                         target::confirm_pid(&mut live.control.conn, a.pid).await?;
                         target::confirm_pid(&mut live.control.conn, b.pid).await?;
@@ -1433,6 +1573,10 @@ pub async fn bench(
                     if verdict == "WRONG" {
                         error!(phase, rep, rows = ?timed.answer.map(|d| d.rows), expected_rows = exp.rows, "WRONG answer");
                     }
+                    let plan_moved = moved(Some(&timed), ex.as_ref());
+                    if plan_moved == Some(true) {
+                        warn!(phase, rep, "the EXPLAIN's session planned another tree than the timed execution ran by: the plan moved, and the rows are not compared");
+                    }
                     info!(
                         phase,
                         rep,
@@ -1445,6 +1589,7 @@ pub async fn bench(
                         peak_rss_kb = timed.watched.peak_rss_kb,
                         witness = seen.as_ref().map_or("", Seen::word),
                         rows_read = ?figures(seen.as_ref(), &live.target).map(|w| w.timed.leaf_rows),
+                        plan_moved = ?plan_moved,
                         "repetition"
                     );
                     if let (Some(l), Some(f)) = (&live.resolved, ex.as_ref().and_then(|e| e.facts.as_ref())) {
@@ -1713,6 +1858,7 @@ mod tests {
             explain: explain::command(180_006),
             config: vec![],
             config_id: "c".into(),
+            plan: PlanSent::Loaded,
         }
     }
 
@@ -1753,6 +1899,7 @@ mod tests {
             answer: Some(b.digest()),
             watched: Watched::default(),
             error: String::new(),
+            plan: None,
         }
     }
 
@@ -1844,6 +1991,125 @@ mod tests {
         assert_eq!(
             a.leaves_detail,
             "EXPLAIN rows on leaves the counters did not see: d"
+        );
+    }
+
+    use serde_json::{json, Value};
+
+    /// The counters of a repetition that read `rows` on the leaf `a`, planning nothing.
+    fn witnessed(rows: i64) -> Seen {
+        let deltas: witness::Deltas = [("s.a".to_string(), (1, rows, 1))].into_iter().collect();
+        Seen::Read {
+            timed: Reading {
+                status: "OK",
+                deltas,
+            },
+            planning: Some(Ok(Reading {
+                status: "OK",
+                deltas: witness::Deltas::new(),
+            })),
+        }
+    }
+
+    /// An EXPLAIN by `plan` that read `rows` on the leaf `a`.
+    fn explained(plan: Value, rows: f64) -> Explained {
+        Explained {
+            status: Status::Ok,
+            facts: Some(Facts {
+                rows: 2.0,
+                plan,
+                ..Facts::default()
+            }),
+            leaves: Some(reported(&["a"], &["a"], rows)),
+            watched: Watched::default(),
+            error: String::new(),
+        }
+    }
+
+    /// A plan that reads the leaf `a` by `scan`.
+    fn by(scan: &str) -> Value {
+        json!({"Node Type": "Hash Join", "Join Type": "Inner", "Total Cost": 9.5, "Plans": [
+            {"Node Type": scan, "Relation Name": "a", "Schema": "s", "Alias": "a", "Total Cost": 4.0},
+            {"Node Type": "Hash", "Plans": [{"Node Type": "Seq Scan", "Relation Name": "b"}]}]})
+    }
+
+    fn timed_by(plan: Option<Result<Value, String>>) -> Timed {
+        Timed {
+            plan,
+            ..timed(&["a", "b"])
+        }
+    }
+
+    fn line(timed: &Timed, ex: &Explained, seen: &Seen) -> Vec<String> {
+        let mut t = target();
+        t.leaves = names(&["a"]);
+        let exp = expected(&["a", "b"]);
+        result_line(
+            &t,
+            &q(),
+            "cold",
+            0,
+            0,
+            1,
+            &exp,
+            Some(timed),
+            Some(ex),
+            Some(seen),
+            "",
+        )
+        .0
+    }
+
+    #[test]
+    fn a_plan_that_moved_is_recorded_with_both_plans_and_its_rows_are_not_compared() {
+        // the counters saw 10 rows; the EXPLAIN, by another plan, 14
+        let f = line(
+            &timed_by(Some(Ok(by("Seq Scan")))),
+            &explained(by("Index Only Scan"), 14.0),
+            &witnessed(10),
+        );
+        assert_eq!(f[column("plan_moved")], "true");
+        assert_eq!(f[column("rows_read_agree")], "");
+        assert_eq!(f[column("leaves_agree")], "");
+        let plan = |c: &str| serde_json::from_str::<Value>(&f[column(c)]).unwrap();
+        assert_eq!(plan("timed_plan"), by("Seq Scan"));
+        assert_eq!(plan("explain_plan"), by("Index Only Scan"));
+        assert_eq!(f[column("verdict")], "RIGHT");
+    }
+
+    #[test]
+    fn the_same_tree_both_ways_is_still_held_to_the_rows_it_read() {
+        // the same tree at another cost: the rows are compared, and 10 against 14 disagree
+        let mut cheaper = by("Seq Scan");
+        cheaper["Plans"][0]["Total Cost"] = json!(2.0);
+        let t = timed_by(Some(Ok(cheaper)));
+        let f = line(&t, &explained(by("Seq Scan"), 14.0), &witnessed(10));
+        assert_eq!(f[column("plan_moved")], "false");
+        assert_eq!(f[column("rows_read_agree")], "false");
+        assert_eq!(f[column("timed_plan")], "");
+        assert_eq!(f[column("explain_plan")], "");
+        let f = line(&t, &explained(by("Seq Scan"), 10.0), &witnessed(10));
+        assert_eq!(f[column("rows_read_agree")], "true");
+    }
+
+    #[test]
+    fn without_the_timed_plan_the_rows_are_compared_as_before() {
+        let ex = explained(by("Index Only Scan"), 14.0);
+        let f = line(&timed_by(None), &ex, &witnessed(10));
+        assert_eq!(f[column("plan_moved")], "");
+        assert_eq!(f[column("rows_read_agree")], "false");
+        // asked for and missing, which the error says
+        let f = line(
+            &timed_by(Some(Err("none came".into()))),
+            &ex,
+            &witnessed(10),
+        );
+        assert_eq!(f[column("plan_moved")], "");
+        assert_eq!(f[column("rows_read_agree")], "false");
+        assert!(
+            f[column("error")].contains("timed plan: none came"),
+            "{}",
+            f[column("error")]
         );
     }
 

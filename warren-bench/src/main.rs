@@ -12,6 +12,7 @@ mod digest;
 mod explain;
 mod index_sets;
 mod kit;
+mod notice;
 #[cfg(test)]
 mod pg_tests;
 mod questions;
@@ -269,16 +270,21 @@ struct SampleArgs {
     no_memory_watchdog: bool,
 }
 
+/// The log, to standard error, and beside it, with a filter of its own, the layer that catches the
+/// server's notices to the timed session (see `notice`).
 fn init_logging(fmt: LogFormat) {
+    use tracing_subscriber::prelude::*;
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
-    let b = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    match fmt {
-        LogFormat::Pretty => b.init(),
-        LogFormat::Json => b.json().init(),
-    }
+    let out = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let out = match fmt {
+        LogFormat::Pretty => out.boxed(),
+        LogFormat::Json => out.json().boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(out.with_filter(filter))
+        .with(notice::layer())
+        .init();
 }
 
 fn valid_timeout(s: &str) -> bool {
@@ -394,9 +400,10 @@ impl Common {
 
 /// Exit status: 0 every answer RIGHT; 1 some answer WRONG; 2 refused or failed to start;
 /// 3 no WRONG answer, but some repetition timed out, was cancelled, failed or did not run;
-/// 4 every answer RIGHT and complete, but some execution and its EXPLAIN disagree on the rows read
-/// or the leaves scanned; 5 no WRONG answer, but a scan used an index its target's index set
-/// turned off; 130 interrupted.
+/// 4 every answer RIGHT and complete, but some execution and its EXPLAIN, planned as the same tree,
+/// disagree on the rows read or the leaves scanned; 5 no WRONG answer, but a scan used an index its
+/// target's index set turned off; 130 interrupted. A plan that moved between the two is recorded,
+/// and changes no exit status.
 const EXIT_WRONG: u8 = 1;
 const EXIT_REFUSED: u8 = 2;
 const EXIT_INCOMPLETE: u8 = 3;
@@ -405,8 +412,9 @@ const EXIT_UNLAWFUL: u8 = 5;
 const EXIT_INTERRUPTED: u8 = 130;
 
 /// Every kind of file this program writes, and the older forms of them it still reads.
-const KNOWN: [&tables::Declared; 11] = [
+const KNOWN: [&tables::Declared; 12] = [
     &report::RESULTS,
+    &report::RESULTS_V3,
     &report::RESULTS_V2,
     &report::RESULTS_V1,
     &report::SUMMARY,
@@ -440,7 +448,12 @@ fn summarize(
 ) -> Result<u8, String> {
     let kind = tables::recognise(
         results,
-        &[&report::RESULTS, &report::RESULTS_V2, &report::RESULTS_V1],
+        &[
+            &report::RESULTS,
+            &report::RESULTS_V3,
+            &report::RESULTS_V2,
+            &report::RESULTS_V1,
+        ],
     )?;
     let t = tables::read(results, kind)?;
     let cells = report::summarise(&t);
@@ -486,10 +499,20 @@ fn summarize(
     for (status, n) in report::unwitnessed(&t) {
         warn!(status = %status, repetitions = n, "the rows witness was not taken alone and settled, so the law was not asked of these");
     }
+    let moved = report::moved(&t);
+    for line in moved.iter().take(20) {
+        warn!(moved = %line, "the EXPLAIN's session planned another tree than the timed execution ran by, so their rows were not compared");
+    }
     // an older form's verdicts are read as that program recorded them, never re-judged
     if kind.name == report::RESULTS.name {
         println!(
-            "execution against EXPLAIN, rows read and leaves scanned: {} disagreements",
+            "execution against EXPLAIN, rows read and leaves scanned: {} disagreements; {} plans moved between the timed execution and its EXPLAIN, their rows not compared",
+            disagree.len(),
+            moved.len()
+        );
+    } else if kind.name == report::RESULTS_V3.name {
+        println!(
+            "execution against EXPLAIN, rows read and leaves scanned, as recorded before the timed execution sent its plan: {} disagreements",
             disagree.len()
         );
     } else if kind.name == report::RESULTS_V2.name {
@@ -1077,6 +1100,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summarize(&path, None, None).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_plan_that_moved_does_not_fail_the_exit_status_and_results_from_before_it_still_read() {
+        let dir = std::env::temp_dir().join(format!("warren-bench-moved-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("results.parquet");
+        let moved = [
+            ("plan_moved", "true"),
+            ("rows_read_agree", ""),
+            ("leaves_agree", ""),
+        ];
+        let held = [
+            ("plan_moved", "false"),
+            ("rows_read_agree", "false"),
+            ("leaves_agree", "true"),
+        ];
+        for (lines, want) in [
+            (vec![line_of(&report::RESULTS, &moved)], 0),
+            (
+                vec![
+                    line_of(&report::RESULTS, &moved),
+                    line_of(&report::RESULTS, &held),
+                ],
+                EXIT_DISAGREE,
+            ),
+        ] {
+            tables::write(&path, &report::RESULTS, &lines).unwrap();
+            assert_eq!(summarize(&path, None, None).unwrap(), want);
+        }
+        let agree = [("rows_read_agree", "true"), ("leaves_agree", "true")];
+        let rows_differ = [("rows_read_agree", "false"), ("leaves_agree", "true")];
+        for (line, want) in [(&agree, 0), (&rows_differ, EXIT_DISAGREE)] {
+            tables::write(
+                &path,
+                &report::RESULTS_V3,
+                &[line_of(&report::RESULTS_V3, line)],
+            )
+            .unwrap();
+            assert_eq!(summarize(&path, None, None).unwrap(), want);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
