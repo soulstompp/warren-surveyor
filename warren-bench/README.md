@@ -19,7 +19,7 @@ cargo install --locked warren-bench --root ~/.local
 It needs Rust 1.96 or later, and puts `warren-bench` in `~/.local/bin`, which must be on your
 `PATH`; without `--root ~/.local`, in `~/.cargo/bin`. The bench carries the kit inside it, the
 questions and the surveyor script (*Questions*, below), and its own index sets, so every command
-on this page runs from any directory. `warren-bench --version` prints `warren-bench 0.1.0`.
+on this page runs from any directory. `warren-bench --version` prints `warren-bench 0.1.1`.
 Installing touches no database. `cargo uninstall --root ~/.local warren-bench` takes it back out;
 its cache directory, `$XDG_CACHE_HOME/warren-bench` (else `~/.cache/warren-bench`), you remove by
 hand.

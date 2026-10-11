@@ -75,7 +75,7 @@ The first installs the bench, `warren-bench`, which steps 2 to 6 run. It carries
 the questions and the script that turns the surveyor on and off. The second installs the
 generator, `sqlc-brickgen` 0.0.2, which step 1 runs. Both land in `~/.local/bin`, which must be on
 your `PATH`; without `--root ~/.local`, they land in `~/.cargo/bin`. `warren-bench --version` prints
-`warren-bench 0.1.0`, and `sqlc-brickgen --help` its flags.
+`warren-bench 0.1.1`, and `sqlc-brickgen --help` its flags.
 
 The extension builds from a clone of this repository, against your server:
 

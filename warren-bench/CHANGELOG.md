@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1
+
+- `--with` and `--respell` compose a directory of `.sqlc` templates with those flags of
+  `cargo sqlc compose`, and the question set's fingerprint follows them. Plain questions refuse
+  both.
+- `--search-path DIR`, given once for each directory, composes the templates with relations from
+  `DIR` too, which are not questions themselves. The binds are checked through them, and the
+  fingerprint follows their files. Plain questions take none.
+- The `manifest.json` that `cargo sqlc compose` writes beside the composed files is no longer
+  counted as a file the templates did not compose.
+- The kit's questions that put others together are in `combined/`, so their names begin
+  `combined/`; they were in `composed/`.
+- `suite/` holds the kit's 25 questions as `.sqlc` templates, each composing to the kit's own
+  question byte for byte, and four more that join a question's rows to the bricks they brought,
+  with the relations they compose in `suite/relations`, read with `--search-path`.
+- The kit's `surveyor.sql` says that a role granted SET on `session_preload_libraries` may set it
+  from PostgreSQL 15.
+
 ## 0.1.0
 
 The first release: the kit's runner. It asks the same questions of a PostgreSQL database under
