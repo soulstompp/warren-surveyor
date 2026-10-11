@@ -51,7 +51,7 @@ enum LogFormat {
 #[command(
     name = "warren-bench",
     version,
-    about = "Run a declared set of questions against Postgres targets, and check every answer"
+    about = "Run a declared set of questions against PostgreSQL targets, and check every answer"
 )]
 struct Cli {
     #[arg(long, value_enum, default_value = "pretty", global = true)]

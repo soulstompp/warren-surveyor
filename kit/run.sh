@@ -9,7 +9,7 @@
 #
 # It checks everything first and changes nothing until every check holds. Then it builds the bench,
 # installs the surveyor's extension into that server, makes the database --db names (it refuses
-# one that exists), loads the LEGO catalogue and the trapped database into it, records every
+# one that exists), loads the real catalogue and the trapped database into it, records every
 # answer with PostgreSQL alone, times every question with PostgreSQL alone, turns the surveyor on,
 # times every question again with it and without it, turns it off, and prints where the results
 # are. Everything it writes stays in this clone, but the extension's files, which go where the
