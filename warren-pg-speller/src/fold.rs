@@ -14,7 +14,7 @@
 
 use crate::catalog::Facts;
 use crate::compat::{expression_tree_mutator, varno};
-use crate::keep::{held_by, unused_name, with_query};
+use crate::keep::{held_by, held_in_arms, hold_arms, unused_name, with_query};
 use crate::levels::{flat, level, movable, Flat};
 use crate::nodes::*;
 use crate::reading::{deepen, reaches_outside, reads};
@@ -726,13 +726,19 @@ pub(crate) unsafe fn folded(
                 m.var as *mut pg_sys::Node,
             )?);
         }
-        // the second side, only at the keys the first side's grouping holds
+        // the second side, only at the keys the first side's grouping holds: in each arm, where its
+        // column of the key is a UNION ALL's
+        let mut in_arms = None;
         if s == 1 {
-            quals.push(held_by(
-                on_side[0].var as *mut pg_sys::Node,
-                first,
-                key_column[0],
-            )?);
+            in_arms = held_in_arms(f.q, on_side[0].var, first, key_column[0]);
+            if in_arms.is_none() {
+                quals.push(held_by(
+                    on_side[0].var as *mut pg_sys::Node,
+                    first,
+                    key_column[0],
+                    0,
+                )?);
+            }
         }
         let mut targets: Vec<(*mut pg_sys::Node, String, pg_sys::Index)> = Vec::new();
         let mut clauses = Vec::new();
@@ -771,6 +777,11 @@ pub(crate) unsafe fn folded(
             agg_columns[i] = Some(targets.len() as i16);
         }
         let sq = level(f.q, side, &quals, &targets, &clauses)?;
+        if let Some(held) = &in_arms {
+            let union = varno(on_side[0].var);
+            let at = side.iter().position(|&i| i == union)? as c_int + 1;
+            hold_arms(sq, at, held);
+        }
         deepen(sq);
         names_of[s] = targets.iter().map(|t| t.1.clone()).collect();
         queries[s] = sq;

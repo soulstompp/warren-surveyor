@@ -26,7 +26,15 @@ pub(crate) enum Indexes {
 /// purchases of each collection row, from 2008 to 2020. `indexes` says which other indexes the
 /// tables carry; every index's pages are read into shared buffers.
 pub(crate) fn lego(indexes: Indexes) {
-    Spi::run(
+    lego_of(indexes, 240);
+}
+
+/// The catalogue `lego` makes, with `sets` sets in place of 240, their inventories and nested sets
+/// numbered as there; the version 2 inventories are numbered from the first thousand above every
+/// version 1 inventory.
+pub(crate) fn lego_of(indexes: Indexes, sets: u32) {
+    let second = (sets / 1000 + 1) * 1000;
+    Spi::run(&format!(
         "CREATE SCHEMA lego; \
          CREATE FUNCTION lego.clock(timestamptz) RETURNS timestamp LANGUAGE sql IMMUTABLE \
              PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$; \
@@ -37,17 +45,17 @@ pub(crate) fn lego(indexes: Indexes) {
          CREATE TABLE lego.lego_sets (set_num varchar(255) PRIMARY KEY, name varchar(255) NOT NULL, \
                                       year int, theme_id int, num_parts int); \
          INSERT INTO lego.lego_sets SELECT 's' || g, 'set ' || g, 1990 + g % 30, 1 + g % 40, 0 \
-         FROM generate_series(1, 240) g; \
+         FROM generate_series(1, {sets}) g; \
          CREATE TABLE lego.lego_inventories (id int PRIMARY KEY, version int NOT NULL, \
                                              set_num varchar(255) NOT NULL); \
-         INSERT INTO lego.lego_inventories SELECT g, 1, 's' || g FROM generate_series(1, 240) g; \
-         INSERT INTO lego.lego_inventories SELECT 1000 + g, 2, 's' || g FROM generate_series(5, 240, 5) g; \
+         INSERT INTO lego.lego_inventories SELECT g, 1, 's' || g FROM generate_series(1, {sets}) g; \
+         INSERT INTO lego.lego_inventories SELECT {second} + g, 2, 's' || g FROM generate_series(5, {sets}, 5) g; \
          CREATE TABLE lego.lego_inventory_sets (inventory_id int NOT NULL, set_num varchar(255) NOT NULL, \
                                                 quantity int NOT NULL); \
-         INSERT INTO lego.lego_inventory_sets SELECT g, 's' || (1 + (g * 13) % 240), 1 + g % 3 \
-         FROM generate_series(7, 240, 7) g; \
-         INSERT INTO lego.lego_inventory_sets SELECT g, 's' || (1 + (g * 29) % 240), 2 \
-         FROM generate_series(14, 240, 14) g; \
+         INSERT INTO lego.lego_inventory_sets SELECT g, 's' || (1 + (g * 13) % {sets}), 1 + g % 3 \
+         FROM generate_series(7, {sets}, 7) g; \
+         INSERT INTO lego.lego_inventory_sets SELECT g, 's' || (1 + (g * 29) % {sets}), 2 \
+         FROM generate_series(14, {sets}, 14) g; \
          CREATE TABLE lego.lego_part_categories (id int PRIMARY KEY, name varchar(255) NOT NULL); \
          INSERT INTO lego.lego_part_categories SELECT g, 'category ' || g FROM generate_series(1, 12) g; \
          CREATE TABLE lego.lego_parts (part_num varchar(255) PRIMARY KEY, name text NOT NULL, \
@@ -69,7 +77,7 @@ pub(crate) fn lego(indexes: Indexes) {
          CREATE TABLE lego.lego_collection (builder_id int NOT NULL, row_no int NOT NULL, \
                                             set_num varchar(255) NOT NULL, typed_set_num varchar(255), \
                                             typed_name varchar(255), PRIMARY KEY (builder_id, row_no)); \
-         INSERT INTO lego.lego_collection SELECT b, r, 's' || (1 + (b * 17 + r * 31) % 240), NULL, NULL \
+         INSERT INTO lego.lego_collection SELECT b, r, 's' || (1 + (b * 17 + r * 31) % {sets}), NULL, NULL \
          FROM generate_series(1, 60) b, generate_series(1, 8) r; \
          CREATE TABLE lego.lego_purchases (purchase_id bigint PRIMARY KEY, builder_id int NOT NULL, \
                                            row_no int NOT NULL, store varchar(64) NOT NULL, \
@@ -81,8 +89,8 @@ pub(crate) fn lego(indexes: Indexes) {
                     + ((c.builder_id * 97 + c.row_no * 389 + g * 1231) % 4700) * interval '1 day' \
                     + (g * 5) * interval '1 hour', \
                 'local', NULL \
-         FROM lego.lego_collection c, generate_series(1, 3) g WHERE g <= 1 + (c.builder_id + c.row_no) % 3",
-    )
+         FROM lego.lego_collection c, generate_series(1, 3) g WHERE g <= 1 + (c.builder_id + c.row_no) % 3"
+    ))
     .expect("the catalogue could not be made");
     if let Indexes::BTrees | Indexes::Surveyors = indexes {
         Spi::run(

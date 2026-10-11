@@ -15,8 +15,8 @@ repository, is one such extension.
 
 To see it, run a statement under `EXPLAIN (ANALYZE, BUFFERS)`. A grouping respelled shows a WITH
 query named `side_a` (`side_a_2`, … where the query has one of that name already), one side's
-grouping, read twice: by the join of the two sides, and by the
-other side's grouping, which keeps only the keys `side_a` holds. A UNION ALL respelled scans the
+grouping, read by the join of the two sides and by the other side's grouping, which keeps only the
+keys `side_a` holds (in each arm, where that side is a UNION ALL). A UNION ALL respelled scans the
 relation its arms share once. PostgreSQL alone, in a session that has not loaded the extension's
 library, shows the plan as written: compare the pages each plan touches, and its temp pages.
 
@@ -221,7 +221,9 @@ ordering* are set out in [The queries it reads](#the-queries-it-reads), and *a u
 ### What it changes
 
 Side B's grouping gains the condition `k IN (SELECT key FROM side_a)`, `k` being side B's column of
-the key: `side_a` is read a second time, and B is grouped only at the keys side A holds.
+the key: `side_a` is read a second time, and B is grouped only at the keys side A holds. Where `k`
+is a column of a UNION ALL, as rule 1 leaves one, each arm gains the condition on its own
+expression of `k` instead, and `side_a` is read once for each arm.
 
 ### The read it cancels
 
@@ -230,16 +232,27 @@ grouped over all its rows, and the join drops the groups at keys side A does not
 those rows are dropped before B is grouped; where PostgreSQL reads B through an index on its key, at
 `side_a`'s keys, they are never read.
 
+In each arm, the rows kept are counted from the arm's own column. On a UNION ALL's column,
+PostgreSQL keeps no count of its values, and counts a fixed share of the union's rows as kept,
+whichever keys `side_a` holds: half, or `side_a`'s rows in 200 where that is less. A union of 40,340
+rows kept to a `side_a` of 194 rows is counted at 20,170 rows kept where 255 are, and PostgreSQL
+plans as many lookups into B's other tables.
+
 ### In EXPLAIN
 
 Under side B's Aggregate, beside B's tables, a `CTE Scan on side_a` gives the keys B is kept to.
-It is the second scan of `side_a`; the first is in the join of the two sides.
+It is the second scan of `side_a`; the first is in the join of the two sides. Where B is a UNION
+ALL, there is one under each arm of its Append.
 
 ### When it applies
 
 It applies wherever a grouping is taken on each side first, and checks nothing of its own. The two
 sides are joined by an inner join at the key, so dropping a row of B whose key side A does not hold
 changes no row of the answer.
+
+The condition goes into each arm only where every arm is a plain SELECT returning `k` with the
+union's own type, so that an arm's own LIMIT or grouping never sees fewer rows; otherwise the union
+is kept as a whole.
 
 ## Using it
 

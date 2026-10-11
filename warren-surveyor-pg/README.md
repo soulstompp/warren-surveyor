@@ -395,8 +395,8 @@ Respelled, the shared relation is read once, each side is held only as its own g
 B's rows at keys side A does not hold are dropped before B is grouped.
 
 **In `EXPLAIN`.** A respelled grouping shows side A's grouping as a `WITH` query named `side_a`,
-read twice: by the join of the two sides, and under side B's grouping, which keeps only the keys
-`side_a` holds.
+read by the join of the two sides and under side B's grouping, which keeps only the keys `side_a`
+holds: in each arm, where side B is a `UNION ALL`.
 
 **Where it stops.** Where any condition a rule checks fails, the statement is planned as written;
 every condition is in [warren-pg-speller's README][speller]. Nothing is respelled inside a parallel

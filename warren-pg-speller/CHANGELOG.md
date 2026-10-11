@@ -6,6 +6,10 @@
   readers again, wherever they are. A WITH query each arm read through a subquery, as
   `cargo sqlc compose --with` writes one, is read in its reader's place once one reader is left, and
   the grouping over it is taken on each side as it is where each arm holds the query's body.
+- Where side B's column of the key is a column of a UNION ALL whose arms are plain SELECTs, each arm
+  is kept to `side_a`'s keys on its own expression of the column, instead of the union as a whole.
+  PostgreSQL counts the rows each arm keeps from that column's statistics; on the union's column it
+  has none, and counted half the union's rows as kept, or `side_a`'s rows in 200.
 - PostgreSQL 14, 15, 16 and 17 as well as 18, each a Cargo feature, `pg14` to `pg18`; `pg18` is the
   default.
 
