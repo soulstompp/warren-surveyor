@@ -12,6 +12,7 @@ finds:
 - the column statistics that joins and groupings are sized by;
 - the rows a `WITH RECURSIVE` query returns, read by running it while the statement is planned;
 - the price of reading your B-trees, from the pages of them that shared buffers hold;
+- the cache a plan's pages stay in, counted as shared buffers;
 - how busy the drive is, which weighs every page a plan would read from the disk.
 
 The planner still chooses the plan, from these where it would otherwise estimate: no index is
@@ -324,8 +325,9 @@ and its share:
   `warren_surveyor_pg.walked_leaf_page_cost` where that is set, else at the tablespace's
   `seq_page_cost` where they follow one another on the disk and `random_page_cost` where they do
   not;
-- repeated scans (the inner side of a loop) count their pages fetched again with the index's own
-  pages, up to the whole of `shared_buffers`, as the cache they stay in, at `random_page_cost`.
+- repeated scans (the inner side of a loop) count their pages fetched again with the index's part
+  of shared buffers as the cache they stay in, shared with the statement's tables by their pages as
+  PostgreSQL shares its cache, at `random_page_cost`.
 
 **Where it stops.** The pass over the headers draws nothing on the budget. The read of the leaves'
 order draws on it; where the budget leaves no page for it, the leaves are priced as following one
@@ -351,6 +353,28 @@ settings are put back when planning ends, an error included.
 **Where it stops.** The weight stops at a hundred. The drive is read on Linux only, and outside
 parallel operations; elsewhere, and where the drive cannot be found, it counts as idle. Its share
 is over the machine's whole uptime, not this minute.
+
+### The cache
+
+**What it reads.** The tables the statement reads, as for the drive, and `shared_buffers` and
+`effective_cache_size`. Once for each statement planned.
+
+**The scan it cancels.** Where a loop looks up a table again and again, PostgreSQL counts how often
+the lookups fetch the same table page again against `effective_cache_size`, which counts the
+operating system's file cache too, 4 GB by default. A table larger than shared buffers then looks
+held: its lookups are priced as fetching each of its pages once, and a plan that reads the table's
+pages again from outside shared buffers, loop after loop, wins on paper.
+
+**In `EXPLAIN`.** Every `cost=` in the plan of a statement that reads a table with a surveyor is
+made with `effective_cache_size` at `shared_buffers`, where it is set above them: the table pages
+that lookups fetch again, and the index pages of every kind of index, are counted against the cache
+the surveyor prices its B-trees' pages against. The setting is put back when planning ends, an error
+included.
+
+**Where it stops.** A cache set below shared buffers is kept, and nothing is set inside a parallel
+operation. PostgreSQL credits a table's order to a scan of its index only in part, so a walk of a
+whole index in key order over a table larger than its part of shared buffers is priced as fetching
+pages again that the walk reads once, in order.
 
 ### Grouping one value at a time
 
@@ -580,8 +604,8 @@ CREATE INDEX lego_sets_surveyor ON lego.lego_sets USING surveyor (set_num);
 - **`warren_surveyor_pg.planning_read_limit`** (integer, in pages, so `64MB` works; default `-1`;
   superuser only): lowers the budget to this many pages where the statement's tables hold more.
   `-1` sets no lower limit; `0` reads no index page and runs no recursive query while planning, so
-  nothing is measured, while the drive's weight, the price of B-trees from shared buffers and
-  grouping one value at a time still apply.
+  nothing is measured, while the drive's weight, the price of B-trees from shared buffers, the
+  cache counted as shared buffers and grouping one value at a time still apply.
 
 Once the library is loaded, every other name under `warren_surveyor_pg.` is refused.
 
@@ -621,6 +645,9 @@ writes it.
 - **`pg_dump` and restore.** A surveyor is dumped as its `CREATE INDEX … USING surveyor`, and
   restored without reading its table; the extension must be installed on the server restored to.
   The database's `session_preload_libraries` travels as any database setting does.
+- **`effective_cache_size`.** While a statement that reads a table with a surveyor is planned, a
+  setting above `shared_buffers` reads as `shared_buffers`, to the planner and to any extension
+  that prices paths, and as set again once planning ends.
 - **Security.** Measured statistics that hold a table's values are offered to the planner only
   where the user may read every row of the column, as PostgreSQL decides for its own statistics,
   row security and column privileges included. Counts alone, which hold no value, always are, and

@@ -10,6 +10,12 @@
   `pg_c_utf8` does from 17 on.
 - Before 18, the B-trees are priced as that version prices them: with no skip scan, a path with no
   condition on its leading column walks the whole index.
+- While a statement that reads a table with a surveyor is planned, `effective_cache_size` set above
+  `shared_buffers` reads as `shared_buffers`, and is put back after, an error included. The table
+  pages repeated lookups fetch are counted against the cache the surveyor prices its B-trees'
+  pages against, instead of the operating system's file cache besides.
+- Repeated scans of a B-tree count its part of shared buffers, shared with the statement's tables
+  by their pages as PostgreSQL shares its cache, instead of all of the index's own pages.
 - `ALTER EXTENSION warren_surveyor_pg UPDATE` takes a 0.1.0 install to 0.1.1.
 - The respelling of `warren-pg-speller` 0.1.2, installed with the library.
 
