@@ -317,6 +317,9 @@ an `interval` among them, is read as the server sends it, so the expected answer
 the same `DateStyle` and `IntervalStyle`. The digest does not depend on
 row order, and it changes when a row is added, removed, repeated or altered. A RIGHT answer also
 needs its EXPLAIN to return the same number of rows. A timing counts only with a RIGHT answer.
+The warren-snail [bench](https://github.com/soulstompp/warren-snail/tree/HEAD/bench) digests its
+answers' rows the same way, in Nushell, and checks itself each run against the test vector
+warren-bench's own tests hold.
 
 **The rows witness.** The EXPLAIN runs in another session, so the bench also reads the server's
 per-table counters around the timed statement itself, and around a plan-only EXPLAIN to take off
