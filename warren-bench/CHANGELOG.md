@@ -31,7 +31,7 @@ different sets of its indexes and records what each answer cost, every answer ch
 fixed beforehand.
 
 - Installs with `cargo install --locked warren-bench`, and carries the kit inside it: its 25
-  questions on the LEGO catalogue, their bound values, and `surveyor.sql`.
+  questions on the catalogue of bricks and sets, their bound values, and `surveyor.sql`.
 - Runs the kit's questions where none are given, from its cache directory
   (`$XDG_CACHE_HOME/warren-bench`, else `~/.cache/warren-bench`); `--questions` and `--binds` give
   others, plain `.sql` files or `.sqlc` templates composed for each target.
