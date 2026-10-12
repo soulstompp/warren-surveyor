@@ -366,4 +366,4 @@ additional terms or conditions.
 
 [LICENSE-APACHE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/LICENSE-APACHE
 [LICENSE-MIT]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/LICENSE-MIT
-[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#--respell
+[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#a-union-of-arms-that-read-one-roster---respell

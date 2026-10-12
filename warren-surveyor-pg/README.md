@@ -707,5 +707,5 @@ License, or (at your option) any later version. See [LICENSE][LICENSE].
 [kit]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/kit/README.md
 [speller]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md
 [speller-catalog]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md#what-it-reads-from-the-catalog
-[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#--respell
+[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#a-union-of-arms-that-read-one-roster---respell
 [LICENSE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-surveyor-pg/LICENSE
