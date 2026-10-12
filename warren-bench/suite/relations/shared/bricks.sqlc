@@ -1,0 +1,21 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# The inventories the rows of @bought bring, each row carrying a set: the set's version 1
+# inventory, once, and the version 1 inventory of each set nested in it, as many times as it is
+# nested. One row per inventory a row brings, with every column of the row, the inventory, and its
+# copies.
+-- the bricks a set brings
+SELECT bt.*, i.id AS inventory_id, 1 AS copies
+FROM (
+    :compose(@bought)
+) bt
+JOIN lego_inventories i ON i.set_num = bt.set_num AND i.version = 1
+UNION ALL
+SELECT bt.*, ci.id, sub.quantity
+FROM (
+    :compose(@bought)
+) bt
+JOIN lego_inventories i      ON i.set_num = bt.set_num AND i.version = 1
+JOIN lego_inventory_sets sub ON sub.inventory_id = i.id
+JOIN lego_inventories ci     ON ci.set_num = sub.set_num AND ci.version = 1

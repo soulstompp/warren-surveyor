@@ -187,6 +187,8 @@ mod tests {
             questions: vec![q("lines/set"), q("parts/category"), q("sets/nested")],
             hash: "h".into(),
             plain: Default::default(),
+            flags: vec![],
+            search: vec![],
         };
         restrict(&mut set, &["lines/".into(), "parts/".into()]).unwrap();
         assert_eq!(set.questions.len(), 2);

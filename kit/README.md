@@ -1,18 +1,18 @@
 # The kit: rerun the surveyor's benchmark yourself
 
 The surveyor is an index that is never scanned and holds nothing. You put one on a table. While a
-statement is planned, it reads the indexes you already have (your B-trees, and the GIN and GiST
-indexes that search words, trigrams, boxes and distances) and tells PostgreSQL's planner what they
-measure. Its library also respells a `SELECT`: it plans it through another spelling that returns
-the same rows and is written to read less. The point is to avoid the disk: fewer pages read from
-outside shared buffers.
+statement is planned, it reads your indexes (the B-trees, and the GIN and GiST indexes that search
+words, trigrams, boxes and distances) and tells PostgreSQL's planner what they measure. Its library
+also respells a `SELECT`: it plans it through another spelling that returns the same rows and is
+written to read less. The point is to avoid the disk: fewer pages read from outside shared buffers.
 
 This kit lets you check that on your own server. One command, `kit/run.sh`, installs what it
 needs and runs seven steps:
 
-1. load a real LEGO catalogue, and a large made-up one built from it to trip indexes (skewed
-   purchases, themes under many roots, names typed each builder's own way, clocks that change),
-   with the indexes a DBA would give it;
+1. load a real catalogue of bricks and sets, and a large made-up one that
+   [sqlc-brickgen][sqlc-brickgen] builds from it to trip indexes (skewed purchases, themes under
+   many roots, names typed each builder's own way, clocks that change), with the indexes a DBA
+   would give it;
 2. turn the surveyor off;
 3. record every answer with PostgreSQL alone;
 4. time every question with PostgreSQL alone;
@@ -25,7 +25,7 @@ We would like to hear what you find, the losses most of all.
 
 ## Run it all
 
-On the machine your PostgreSQL 18 server runs on:
+On the machine your PostgreSQL 14 to 18 server runs on:
 
 ```sh
 git clone https://github.com/soulstompp/warren-surveyor
@@ -39,12 +39,12 @@ script checks every need in *What you need* below and cargo-pgrx 0.19.2, and nam
 missing with the command that installs it.
 
 Then it runs the steps below in order. It builds the bench inside the clone, installs the generator
-there too unless `sqlc-brickgen` is already on your `PATH`, and installs the extension into the
-server's own directories (give `--sudo` on a server installed by a package manager): the one thing
-it writes outside the clone, but the database. It makes and loads the database (step 1), turns the
-surveyor off and records every answer with PostgreSQL alone (steps 2 and 3), times every question
-with PostgreSQL alone (step 4), turns the surveyor on and times every question with it and without
-it (steps 5 and 6), and turns it off again.
+there too unless the `sqlc-brickgen` on your `PATH` is 0.0.2 or later, and installs the extension
+into the server's own directories (give `--sudo` on a server installed by a package manager): the
+one thing it writes outside the clone, but the database. It makes and loads the database (step 1),
+turns the surveyor off and records every answer with PostgreSQL alone (steps 2 and 3), times every
+question with PostgreSQL alone (step 4), turns the surveyor on and times every question with it and
+without it (steps 5 and 6), and turns it off again.
 
 It ends by printing each run's summary, and leaves every file under `runs/<size>-<time>/` in the
 clone: `run/summary.txt` and `alone/summary.txt`, which step 7 reads, and `facts.txt`, what ran on
@@ -62,20 +62,20 @@ but the extension's files is inside the clone; the extension comes out as *Unins
 
 To run the steps one by one instead, install the bench, the generator and the surveyor's extension
 once. They need Rust 1.96 or later; the extension also needs cargo-pgrx 0.19.2
-(`cargo install cargo-pgrx --version 0.19.2 --locked`), your PostgreSQL 18's `pg_config`, and, on
+(`cargo install cargo-pgrx --version 0.19.2 --locked`), your PostgreSQL's `pg_config`, and, on
 a server installed by a package manager, its development package (the server's headers) and
 libclang, which pgrx builds against.
 
 ```sh
 cargo install --locked warren-bench --root ~/.local
-cargo install --locked sqlc-brickgen --root ~/.local
+cargo install --locked sqlc-brickgen --version 0.0.2 --root ~/.local
 ```
 
 The first installs the bench, `warren-bench`, which steps 2 to 6 run. It carries the kit inside it:
 the questions and the script that turns the surveyor on and off. The second installs the
-generator, `sqlc-brickgen`, which step 1 runs. Both land in `~/.local/bin`, which must be on your
-`PATH`; without `--root ~/.local`, they land in `~/.cargo/bin`. `warren-bench --version` prints
-`warren-bench 0.1.0`, and `sqlc-brickgen --help` its flags.
+generator, `sqlc-brickgen` 0.0.2, which step 1 runs. Both land in `~/.local/bin`, which must be on
+your `PATH`; without `--root ~/.local`, they land in `~/.cargo/bin`. `warren-bench --version` prints
+`warren-bench 0.1.1`, and `sqlc-brickgen --help` its flags.
 
 The extension builds from a clone of this repository, against your server:
 
@@ -83,12 +83,13 @@ The extension builds from a clone of this repository, against your server:
 git clone https://github.com/soulstompp/warren-surveyor
 cd warren-surveyor/warren-surveyor-pg
 PG_CONFIG=/path/to/pg_config
-mkdir -p ~/.pgrx && printf '[configs]\npg18 = "%s"\n' "$PG_CONFIG" > ~/.pgrx/config.toml
+PG_MAJOR=$("$PG_CONFIG" --version | awk '{print $2}' | cut -d. -f1)
+mkdir -p ~/.pgrx && printf '[configs]\npg%s = "%s"\n' "$PG_MAJOR" "$PG_CONFIG" > ~/.pgrx/config.toml
 cargo pgrx install --release --pg-config "$PG_CONFIG"
 ```
 
 pgrx reads where your PostgreSQL is from `~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`): the
-`printf` writes that file, and where it exists already, add the `pg18` line under its `[configs]`
+`printf` writes that file, and where it exists already, add that `pg` line under its `[configs]`
 instead. `cargo pgrx install` builds the extension `warren_surveyor_pg` and copies its library,
 `warren_surveyor_pg.so`, into the directory `"$PG_CONFIG" --pkglibdir` prints, and its control
 file and SQL into the server's extension directory: step 5 creates the extension from them. It is
@@ -99,7 +100,7 @@ manager, add `--sudo`. To see that the server has it, ask:
 SELECT name, default_version FROM pg_available_extensions WHERE name = 'warren_surveyor_pg';
 ```
 
-It gives `0.1.0`. Installing changes no database and no setting: the library acts only in a
+It gives `0.1.1`. Installing changes no database and no setting: the library acts only in a
 session that loads it, and step 5 is the one that has the kit's database load it. To take it all
 back out: `cargo uninstall --root ~/.local warren-bench sqlc-brickgen`; the bench's cache directory,
 `~/.cache/warren-bench` (or under `$XDG_CACHE_HOME`); and the extension, as *Uninstalling* in
@@ -134,14 +135,16 @@ pages first.
 
 ## What you need
 
-- **PostgreSQL 18**, a server you can create a database on, as a superuser: the load creates
-  `earthdistance`, the surveyor's extension is one only a superuser may create, and turning it on
-  sets the database's `session_preload_libraries`. Its `psql`, and the contrib extensions `cube`,
-  `earthdistance` and `pg_trgm`.
+- **PostgreSQL 14 to 18** (14.19, 15.14, 16.10, 17.6 or later), a server you can create a database
+  on, as a superuser: the load creates `earthdistance`, the surveyor's extension is one only a
+  superuser may create, and turning it on sets the database's `session_preload_libraries`. Its
+  `psql`, and the contrib extensions `cube`, `earthdistance` and `pg_trgm`. On 14 and 15, building
+  a surveyor warns that an UPDATE changing one of its columns is no longer HOT.
 - `curl`, and about 4 GB of disk for the small load, which takes under a minute.
 - The bench on the server's own machine, on Linux: it reads each backend's memory from `/proc` to
   stop a statement before it takes the server's memory. For a server elsewhere, give `truth` and
-  `run` `--no-memory-watchdog`. It connects without TLS.
+  `run` `--no-memory-watchdog`. It connects without TLS. On 14 it runs without its rows witness,
+  which needs 15.
 
 Every command below names the database by URL. Write yours in once:
 
@@ -151,9 +154,10 @@ DB=postgres://USER@HOST:5432/lego
 
 ## Where the data comes from, and its terms
 
-The kit ships no data: step 1 downloads the real catalogue to your machine, and `sqlc-brickgen`
-builds the rest from it and from the cities it ships, Natural Earth's populated places (public
-domain). The catalogue is Neon's sample dump, `lego.sql` in
+The kit ships no data: step 1 downloads the real catalogue to your machine, and
+[sqlc-brickgen][sqlc-brickgen], which lives in sql-composer's repository, builds the rest from it
+and from the cities it ships, Natural Earth's populated places (public domain). The catalogue is
+Neon's sample dump, `lego.sql` in
 [neondatabase/postgres-sample-dbs](https://github.com/neondatabase/postgres-sample-dbs), a
 repository under the MIT licence, whose README gives the data's source as Kaggle's
 [LEGO Database](https://www.kaggle.com/datasets/rtatman/lego-database) (rtatman), which Kaggle lists
@@ -171,25 +175,26 @@ psql -X -d postgres://USER@HOST:5432/postgres -c 'CREATE DATABASE lego'
 curl -sSfL https://raw.githubusercontent.com/neondatabase/postgres-sample-dbs/main/lego.sql \
     | psql -X -q -v ON_ERROR_STOP=1 -d $DB
 sqlc-brickgen --database-url $DB --size small \
-    --oo-schema lego_oo --partitioning inheritance,range,hash
+    --oo-schema lego_oo --partitioning inheritance,range,hash --extension-schema public
 ```
 
 The first two make the kit's database and load the real catalogue into its `public` schema: eight
-`lego_*` tables of colours, themes, part categories, parts, sets, inventories and their lines. The
-generator reads them, writes them through into the schema `lego`, and adds the made-up catalogue:
-20 thousand more sets at `small`, 2 million at `huge`, with their builders, the builders'
-collections and their purchases, and every trap it knows. It also builds the DBA's indexes, the
-ones every later step measures against: the primary and unique keys, composite indexes for the
-joins holding in `INCLUDE` the columns the questions read, and an index for each search those do
-not serve, a postcode by its prefix (a B-tree), a home by its distance (GiST), a part's name by its
-words and a name by its trigrams (GIN).
+`lego_*` tables of colours, themes, part categories, parts, sets, inventories and their lines.
+sqlc-brickgen reads them, writes them through into the schema `lego`, and adds the made-up
+catalogue: 20 thousand more sets at `small`, 2 million at `huge`, with their builders, the
+builders' collections and their purchases, and every trap it knows. It also builds the DBA's
+indexes, the ones every later step measures against: the primary and unique keys, composite
+indexes for the joins holding in `INCLUDE` the columns the questions read, and an index for each
+search those do not serve, a postcode by its prefix (a B-tree), a home by its distance (GiST), a
+part's name by its words and a name by its trigrams (GIN).
 
 `--oo-schema lego_oo` adds the same rows decomposed by table inheritance into classes (sets by
 kind of theme, colours by hue, builders by country); question 19 reads its colour wheel,
 `lego_oo.colour_wheel`, so the questions need this flag. `--partitioning` adds partitioned copies,
 one schema per method: `lego_inheritance`, `lego_range` and `lego_hash`. The questions read `lego`;
 the others give the surveyor classes and partitions to stand on, and you tables for your own
-questions.
+questions. `--extension-schema public` creates the extensions the search indexes need, `cube`,
+`earthdistance` and `pg_trgm`, in `public`, where the questions find them.
 
 The generator ends by printing `SUMMARY` lines: each table's size, then the load's
 `wall_seconds`.
@@ -362,19 +367,19 @@ rather than the drive; on a server whose memory cannot hold them, it comes from 
 | single/10_tools_parts | 8 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 4 / 4 / 4 | 0 / 12 / 14 | 0 / 0 / 0 | 0.03 / 0.05 / 0.45 | 0.09 / 0.10 / 0.60 |
 | single/11_castle_subtree_per_theme | 17 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 158 / 158 / 187 | 0 / 33 / 205 | 0 / 0 / 0 | 0.13 / 0.15 / 1.22 | 1.85 / 1.71 / 2.75 |
 | single/12_star_wars_class_per_year | 19 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 844 / 844 / 844 | 0 / 17 / 1196 | 0 / 0 / 0 | 0.07 / 0.11 / 7.59 | 9.46 / 9.32 / 16.76 |
-| composed/13_decembers_2016_2020_with_builders | 5 | RIGHT | 0 (10633) / 0 (4629) / 0 (0) | 2044472 / 2044472 / 2044472 | 0 / 15 / 229 | 9204 / 9204 / 9204 | 0.12 / 0.17 / 1.34 | 827.08 / 824.06 / 830.11 |
-| composed/14_london_15km_december_2020 | 31 | RIGHT | 22819.5 (22837) / 22819.5 (22834) / 22273 (22292) | 887241 / 887241.5 / 887241 | 18 / 48 / 896 | 0 / 0 / 0 | 0.30 / 0.36 / 6.55 | 97.50 / 95.33 / 91.96 |
-| composed/15_helmet_accessories | 371 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 123 / 123 / 123 | 1 / 13 / 54 | 0 / 0 / 0 | 0.06 / 0.10 / 0.59 | 0.35 / 0.42 / 0.98 |
-| composed/16_town_2010s_per_theme | 22 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 4401 / 4401 / 502 | 14 / 47 / 7435 | 0 / 0 / 0 | 0.21 / 0.30 / 57.06 | 56.45 / 57.37 / 61.15 |
-| composed/17_newest_castle_knights | 20 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 8934 / 9006 / 5541 | 1 / 34 / 235 | 0 / 0 / 0 | 0.16 / 0.23 / 1.59 | 8.64 / 11.23 / 37.77 |
-| composed/18_star_wars_decembers | 5 | RIGHT | 548348 (548348) / 548348 (548348) / 548345 (548346) | 2577994 / 2577999.5 / 2577994 | 38 / 83 / 1508 | 27200 / 27220 / 27252 | 0.39 / 0.53 / 10.39 | 1576.87 / 1581.24 / 1576.49 |
-| composed/19_castle_primary_colours | 17 | RIGHT | 754116 (758064) / 754116 (758064) / 39817.5 (39927) | 759679 / 759681 / 207619 | 38 / 113 / 311 | 126243 / 126234 / 639 | 0.43 / 0.55 / 2.19 | 2647.23 / 2586.16 / 291.42 |
-| composed/20_denmark_15_december_per_city | 12 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 43822 / 43822 / 43822 | 60 / 133 / 487 | 682 / 682 / 682 | 0.46 / 0.57 / 2.13 | 35.25 / 33.81 / 32.09 |
-| composed/21_aarhus_1km_castle_purchases | 20 | RIGHT | 31439.5 (31467) / 0 (13373) / 0 (2784) | 232570 / 16334 / 17860 | 75 / 135 / 464 | 6444 / 0 / 0 | 0.69 / 0.71 / 2.82 | 203.75 / 18.55 / 16.76 |
-| composed/22_1980_1999_lego_own_roots | 39 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 2411 / 2411 / 2417 | 0 / 33 / 4258 | 0 / 0 / 0 | 0.20 / 0.23 / 26.62 | 31.80 / 31.15 / 44.79 |
-| composed/23_london_ec_decembers | 15 | RIGHT | 0 (0) / 0 (4600) / 0 (0) | 18570.5 / 18570 / 15787 | 48 / 108 / 371 | 0 / 0 / 0 | 0.37 / 0.45 / 1.76 | 29.48 / 29.19 / 18.49 |
-| composed/24_castle_crown_sets | 8 | RIGHT | 771504 (776626) / 771347 (777269) / 38731 (38818) | 778262 / 778262 / 4333057 | 41 / 119 / 361 | 0 / 0 / 0 | 0.47 / 0.55 / 2.28 | 1239.09 / 1217.78 / 1504.44 |
-| proof/25_town_trucks_helmet_london | 10 | RIGHT | 86176 (86179) / 86175.5 (86179) / 63598 (63640) | 392868.5 / 392872.5 / 374378 | 134 / 255 / 1600 | 0 / 0 / 0 | 2.11 / 2.29 / 13.34 | 234.84 / 225.69 / 334.76 |
+| combined/13_decembers_2016_2020_with_builders | 5 | RIGHT | 0 (10633) / 0 (4629) / 0 (0) | 2044472 / 2044472 / 2044472 | 0 / 15 / 229 | 9204 / 9204 / 9204 | 0.12 / 0.17 / 1.34 | 827.08 / 824.06 / 830.11 |
+| combined/14_london_15km_december_2020 | 31 | RIGHT | 22819.5 (22837) / 22819.5 (22834) / 22273 (22292) | 887241 / 887241.5 / 887241 | 18 / 48 / 896 | 0 / 0 / 0 | 0.30 / 0.36 / 6.55 | 97.50 / 95.33 / 91.96 |
+| combined/15_helmet_accessories | 371 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 123 / 123 / 123 | 1 / 13 / 54 | 0 / 0 / 0 | 0.06 / 0.10 / 0.59 | 0.35 / 0.42 / 0.98 |
+| combined/16_town_2010s_per_theme | 22 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 4401 / 4401 / 502 | 14 / 47 / 7435 | 0 / 0 / 0 | 0.21 / 0.30 / 57.06 | 56.45 / 57.37 / 61.15 |
+| combined/17_newest_castle_knights | 20 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 8934 / 9006 / 5541 | 1 / 34 / 235 | 0 / 0 / 0 | 0.16 / 0.23 / 1.59 | 8.64 / 11.23 / 37.77 |
+| combined/18_star_wars_decembers | 5 | RIGHT | 548348 (548348) / 548348 (548348) / 548345 (548346) | 2577994 / 2577999.5 / 2577994 | 38 / 83 / 1508 | 27200 / 27220 / 27252 | 0.39 / 0.53 / 10.39 | 1576.87 / 1581.24 / 1576.49 |
+| combined/19_castle_primary_colours | 17 | RIGHT | 754116 (758064) / 754116 (758064) / 39817.5 (39927) | 759679 / 759681 / 207619 | 38 / 113 / 311 | 126243 / 126234 / 639 | 0.43 / 0.55 / 2.19 | 2647.23 / 2586.16 / 291.42 |
+| combined/20_denmark_15_december_per_city | 12 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 43822 / 43822 / 43822 | 60 / 133 / 487 | 682 / 682 / 682 | 0.46 / 0.57 / 2.13 | 35.25 / 33.81 / 32.09 |
+| combined/21_aarhus_1km_castle_purchases | 20 | RIGHT | 31439.5 (31467) / 0 (13373) / 0 (2784) | 232570 / 16334 / 17860 | 75 / 135 / 464 | 6444 / 0 / 0 | 0.69 / 0.71 / 2.82 | 203.75 / 18.55 / 16.76 |
+| combined/22_1980_1999_lego_own_roots | 39 | RIGHT | 0 (0) / 0 (0) / 0 (0) | 2411 / 2411 / 2417 | 0 / 33 / 4258 | 0 / 0 / 0 | 0.20 / 0.23 / 26.62 | 31.80 / 31.15 / 44.79 |
+| combined/23_london_ec_decembers | 15 | RIGHT | 0 (0) / 0 (4600) / 0 (0) | 18570.5 / 18570 / 15787 | 48 / 108 / 371 | 0 / 0 / 0 | 0.37 / 0.45 / 1.76 | 29.48 / 29.19 / 18.49 |
+| combined/24_castle_crown_sets | 8 | RIGHT | 771504 (776626) / 771347 (777269) / 38731 (38818) | 778262 / 778262 / 4333057 | 41 / 119 / 361 | 0 / 0 / 0 | 0.47 / 0.55 / 2.28 | 1239.09 / 1217.78 / 1504.44 |
+| in_one/25_town_trucks_helmet_london | 10 | RIGHT | 86176 (86179) / 86175.5 (86179) / 63598 (63640) | 392868.5 / 392872.5 / 374378 | 134 / 255 / 1600 | 0 / 0 / 0 | 2.11 / 2.29 / 13.34 | 234.84 / 225.69 / 334.76 |
 
 How we read it:
 
@@ -413,3 +418,5 @@ The kit (this directory, and the questions and script inside `warren-bench`) and
 are licensed under either of the Apache License, Version 2.0 or the MIT license, at your option
 ([LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT)). `warren-surveyor-pg` is under the
 GNU General Public License, version 3 or later.
+
+[sqlc-brickgen]: https://github.com/soulstompp/sql-composer/tree/HEAD/examples/sqlc-brickgen

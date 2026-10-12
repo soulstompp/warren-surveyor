@@ -15,8 +15,8 @@ repository, is one such extension.
 
 To see it, run a statement under `EXPLAIN (ANALYZE, BUFFERS)`. A grouping respelled shows a WITH
 query named `side_a` (`side_a_2`, … where the query has one of that name already), one side's
-grouping, read twice: by the join of the two sides, and by the
-other side's grouping, which keeps only the keys `side_a` holds. A UNION ALL respelled scans the
+grouping, read by the join of the two sides and by the other side's grouping, which keeps only the
+keys `side_a` holds (in each arm, where that side is a UNION ALL). A UNION ALL respelled scans the
 relation its arms share once. PostgreSQL alone, in a session that has not loaded the extension's
 library, shows the plan as written: compare the pages each plan touches, and its temp pages.
 
@@ -25,6 +25,11 @@ holds; every other query is planned as written, and so is a statement whose spel
 other than a cancel. A spelling is built from the statement as PostgreSQL parsed it, never from its
 text, and reads no table the statement does not read: each as the statement reads it, as the owner
 of the view it lies in or as the user running the statement, under the same row security.
+
+A statement [sql-composer](https://github.com/soulstompp/sql-composer) composes reaches PostgreSQL
+as plain SQL, and is read as any other. The one respelling its composed text proves alone, a union
+whose arms each read one relation for their own rows of it, sql-composer writes into the file
+itself, under [`--respell`][respell]; the rules below rest on the catalog, and are the speller's.
 
 ## Rule 1: a join every arm of a UNION ALL shares is made once
 
@@ -55,7 +60,8 @@ original order. The union's WITH queries, ORDER BY, LIMIT and OFFSET stay on the
 ### The read it cancels
 
 As written, A is read once for each arm and joined in each. Respelled, it is read and joined once,
-to the rows of every arm's rest together. Where A is a WITH query, as written each arm reads it;
+to the rows of every arm's rest together. Where A is a WITH query, or a subquery that reads one (as
+`cargo sqlc compose --with` writes a relation every arm reads), as written each arm reads it;
 respelled, it is read once, and where nothing else reads it PostgreSQL may read it in place instead
 of storing it.
 
@@ -215,7 +221,9 @@ ordering* are set out in [The queries it reads](#the-queries-it-reads), and *a u
 ### What it changes
 
 Side B's grouping gains the condition `k IN (SELECT key FROM side_a)`, `k` being side B's column of
-the key: `side_a` is read a second time, and B is grouped only at the keys side A holds.
+the key: `side_a` is read a second time, and B is grouped only at the keys side A holds. Where `k`
+is a column of a UNION ALL, as rule 1 leaves one, each arm gains the condition on its own
+expression of `k` instead, and `side_a` is read once for each arm.
 
 ### The read it cancels
 
@@ -224,16 +232,27 @@ grouped over all its rows, and the join drops the groups at keys side A does not
 those rows are dropped before B is grouped; where PostgreSQL reads B through an index on its key, at
 `side_a`'s keys, they are never read.
 
+In each arm, the rows kept are counted from the arm's own column. On a UNION ALL's column,
+PostgreSQL keeps no count of its values, and counts a fixed share of the union's rows as kept,
+whichever keys `side_a` holds: half, or `side_a`'s rows in 200 where that is less. A union of 40,340
+rows kept to a `side_a` of 194 rows is counted at 20,170 rows kept where 255 are, and PostgreSQL
+plans as many lookups into B's other tables.
+
 ### In EXPLAIN
 
 Under side B's Aggregate, beside B's tables, a `CTE Scan on side_a` gives the keys B is kept to.
-It is the second scan of `side_a`; the first is in the join of the two sides.
+It is the second scan of `side_a`; the first is in the join of the two sides. Where B is a UNION
+ALL, there is one under each arm of its Append.
 
 ### When it applies
 
 It applies wherever a grouping is taken on each side first, and checks nothing of its own. The two
 sides are joined by an inner join at the key, so dropping a row of B whose key side A does not hold
 changes no row of the answer.
+
+The condition goes into each arm only where every arm is a plain SELECT returning `k` with the
+union's own type, so that an arm's own LIMIT or grouping never sees fewer rows; otherwise the union
+is kept as a whole.
 
 ## Using it
 
@@ -243,6 +262,7 @@ pgrx = "=0.19.2"
 warren-pg-speller = { version = "0.1", default-features = false }
 
 [features]
+pg16 = ["pgrx/pg16", "warren-pg-speller/pg16"]
 pg18 = ["pgrx/pg18", "warren-pg-speller/pg18"]
 ```
 
@@ -260,8 +280,9 @@ extension's library before the statement is planned: `shared_preload_libraries` 
 every session, `session_preload_libraries` for the new sessions of the database or role it is set
 on, and `LOAD` for one session.
 
-It needs PostgreSQL 18 and pgrx 0.19.2. The `pg18` feature is the default; `pg19` builds the hook
-for PostgreSQL 19's planner signature, as pgrx 0.19.2 binds its beta 2, and is not yet tested.
+It needs PostgreSQL 14 to 18 and pgrx 0.19.2, a feature for each, `pg14` to `pg18`. The `pg18`
+feature is the default; `pg19` builds the hook for PostgreSQL 19's planner signature, as pgrx 0.19.2
+binds its beta 2, and is not yet tested.
 
 ## The queries it reads
 
@@ -334,11 +355,15 @@ Copyright (c) 2026 Kenneth Allen Flegal
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE][LICENSE-APACHE])
+- MIT license ([LICENSE-MIT][LICENSE-MIT])
 
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the
 work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
 additional terms or conditions.
+
+[LICENSE-APACHE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/LICENSE-APACHE
+[LICENSE-MIT]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/LICENSE-MIT
+[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#a-union-of-arms-that-read-one-roster---respell

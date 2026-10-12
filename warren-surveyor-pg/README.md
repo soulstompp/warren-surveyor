@@ -2,16 +2,17 @@
 
 *It measures without digging.*
 
-The surveyor is an index for PostgreSQL 18 that is never scanned and holds nothing. You put one on
-a table, on the table's own unique key. While a statement is planned, it reads the indexes you
-already have, your B-trees and the GIN and GiST indexes that search words, trigrams, boxes and
-distances, from the top, stopping above the leaf pages wherever it can. Then it hands the planner
-what it finds:
+The surveyor is an index for PostgreSQL 14 to 18 that is never scanned and holds nothing. You put
+one on a table, on the table's own unique key. While a statement is planned, it reads your
+indexes, the B-trees and the GIN and GiST indexes that search words, trigrams, boxes and distances,
+from the top, stopping above the leaf pages wherever it can. Then it hands the planner what it
+finds:
 
 - the rows each table's conditions select;
 - the column statistics that joins and groupings are sized by;
 - the rows a `WITH RECURSIVE` query returns, read by running it while the statement is planned;
 - the price of reading your B-trees, from the pages of them that shared buffers hold;
+- the cache a plan's pages stay in, counted as shared buffers;
 - how busy the drive is, which weighs every page a plan would read from the disk.
 
 The planner still chooses the plan, from these where it would otherwise estimate: no index is
@@ -27,7 +28,7 @@ is taken on each side first, and one side is grouped only at the keys the other 
 
 It is the extension `warren_surveyor_pg`, and its access method is `surveyor`. To watch it work on
 your own server, on a database built to trip indexes, with every answer checked, start with
-[the kit](../kit/README.md): one command, `kit/run.sh`, runs it all.
+[the kit][kit]: one command, `kit/run.sh`, runs it all.
 
 ## Install
 
@@ -48,7 +49,7 @@ that the server has them:
 SELECT name, default_version FROM pg_available_extensions WHERE name = 'warren_surveyor_pg';
 ```
 
-It gives `0.1.0`. Installing changes no database and no setting: the library acts only in a session
+It gives `0.1.1`. Installing changes no database and no setting: the library acts only in a session
 that loads it, and the access method exists only in a database that creates the extension.
 *Uninstalling*, under *Reference*, takes it back out.
 
@@ -325,7 +326,8 @@ and its share:
   `seq_page_cost` where they follow one another on the disk and `random_page_cost` where they do
   not;
 - repeated scans (the inner side of a loop) count their pages fetched again with the index's own
-  pages, up to the whole of `shared_buffers`, as the cache they stay in, at `random_page_cost`.
+  pages, up to the whole of the cache the planner counts (`shared_buffers`, or a lesser
+  `effective_cache_size`), as the cache they stay in, at `random_page_cost`.
 
 **Where it stops.** The pass over the headers draws nothing on the budget. The read of the leaves'
 order draws on it; where the budget leaves no page for it, the leaves are priced as following one
@@ -336,7 +338,7 @@ another.
 **What it reads.** For the database's own tablespace and the tablespace of each table with a
 surveyor that the statement reads or writes, through a view or as a member of a table it reads with
 its members: the drive holding it, and from `/proc/diskstats` and `/proc/uptime`, the share of the
-machine's uptime the drive has spent doing I/O. Once for each statement planned.
+machine's uptime the drive has spent busy. Once for each statement planned.
 
 **The scan it cancels.** A page from a busy drive waits. Priced as if the drive were idle, a plan
 that reads the disk wins on paper and loses on the server.
@@ -351,6 +353,31 @@ settings are put back when planning ends, an error included.
 **Where it stops.** The weight stops at a hundred. The drive is read on Linux only, and outside
 parallel operations; elsewhere, and where the drive cannot be found, it counts as idle. Its share
 is over the machine's whole uptime, not this minute.
+
+### The cache
+
+**What it reads.** The tables the statement reads, as for the drive, and `shared_buffers` and
+`effective_cache_size`. Once for each statement planned.
+
+**The scan it cancels.** Where a loop looks up a table again and again, PostgreSQL counts how often
+the lookups fetch the same table page again against `effective_cache_size`, which counts the
+operating system's file cache too, 4 GB by default. A table larger than shared buffers then looks
+held: its lookups are priced as fetching each of its pages once, and a plan that reads the table's
+pages again from outside shared buffers, loop after loop, wins on paper.
+
+**In `EXPLAIN`.** Every `cost=` in the plan of a statement that reads a table with a surveyor is
+made with `effective_cache_size` at `shared_buffers`, where it is set above them: the table pages
+that lookups fetch again, and the index pages of every kind of index, are counted against the cache
+the surveyor prices its B-trees' pages against. The setting is put back when planning ends, an error
+included. On a 3.2 GB database, sqlc-brickgen's `small`, with shared buffers at 128 MB,
+warren-bench's suite question `bricks/purchases_decembers_2016_2020` read 37,889 pages from outside
+shared buffers in 2,089 ms with the cache counted at its 4 GB default, and 2,629 in 987 ms with it
+counted at shared buffers.
+
+**Where it stops.** A cache set below shared buffers is kept, and nothing is set inside a parallel
+operation. PostgreSQL credits a table's order to a scan of its index only in part, so a walk of a
+whole index in key order over a table larger than its part of shared buffers is priced as fetching
+pages again that the walk reads once, in order.
 
 ### Grouping one value at a time
 
@@ -373,11 +400,11 @@ it.
 
 ### The respelling
 
-**What it reads.** In a session that has loaded the library, every `SELECT`, with a surveyor on its
-tables or none, and the catalog where a rule needs it, as [warren-pg-speller's
-README](../warren-pg-speller/README.md#what-it-reads-from-the-catalog) sets out. Wherever the
-statement and the catalog show it returns the same rows, the statement is planned through another
-spelling of it:
+**What it reads.** While PostgreSQL plans, in a session that has loaded the library: every
+`SELECT`, with a surveyor on its tables or none, as PostgreSQL parsed it, and the catalog where a
+rule needs it, as [warren-pg-speller's README][speller-catalog] sets out. Wherever the statement
+and the catalog show it returns the same rows, the statement is planned through another spelling of
+it:
 
 - *a join every arm of a `UNION ALL` shares is made once*, to a `UNION ALL` of the rest of each
   arm;
@@ -395,21 +422,25 @@ Respelled, the shared relation is read once, each side is held only as its own g
 B's rows at keys side A does not hold are dropped before B is grouped.
 
 **In `EXPLAIN`.** A respelled grouping shows side A's grouping as a `WITH` query named `side_a`,
-read twice: by the join of the two sides, and under side B's grouping, which keeps only the keys
-`side_a` holds.
+read by the join of the two sides and under side B's grouping, which keeps only the keys `side_a`
+holds: in each arm, where side B is a `UNION ALL`.
 
 **Where it stops.** Where any condition a rule checks fails, the statement is planned as written;
-every condition is in [warren-pg-speller's README](../warren-pg-speller/README.md). Nothing is
-respelled inside a parallel operation. A respelling that raises an error once it has begun to build
-a spelling, a cancel apart, is rolled back, and the statement is planned as written, with the
-budget and the surveyor's measures as they stood before the respelling began; the two plannings
-together may then read up to twice the budget. An error while it is still deciding whether a rule
-applies fails the statement.
+every condition is in [warren-pg-speller's README][speller]. Nothing is respelled inside a parallel
+operation. A respelling that raises an error once it has begun to build a spelling, a cancel apart,
+is rolled back, and the statement is planned as written, with the budget and the surveyor's
+measures as they stood before the respelling began; the two plannings together may then read up to
+twice the budget. An error while it is still deciding whether a rule applies fails the statement.
+
+This respelling is made while PostgreSQL plans, from the statement and the catalog. The one the
+composed text proves alone is made before: a union whose arms each read one relation for their own
+rows of it is written into the composed file by [sql-composer's `--respell`][respell], and the
+library plans that file as it plans any statement.
 
 ## Checking it
 
-Run the statement under `EXPLAIN (ANALYZE, BUFFERS)` (PostgreSQL 18 turns `BUFFERS` on with
-`ANALYZE`; writing it keeps the habit), with the surveyor and without, and read in this order:
+Run the statement under `EXPLAIN (ANALYZE, BUFFERS)` (`BUFFERS` comes with `ANALYZE` from PostgreSQL
+18, and is written out before it), with the surveyor and without, and read in this order:
 
 1. **The disk.** Each scan's `Buffers:` line: `shared read` is pages from outside shared buffers.
    A node's buffers include its children's, so read each scan's own.
@@ -453,8 +484,10 @@ Almost nothing, and nothing on the disk:
   It stays at 0 bytes through inserts, updates and deletes, `VACUUM`, `VACUUM FULL`, `REINDEX`
   (`CONCURRENTLY` too) and `TRUNCATE`.
 - **Nothing written.** A new row is nothing to a surveyor, and writes nothing to the WAL for it.
-- **HOT stays HOT.** A surveyor never keeps an update from being HOT: an update may change the
-  columns it names and still be a HOT update.
+- **HOT stays HOT, from PostgreSQL 16.** On 16 to 18 a surveyor never keeps an update from being
+  HOT: an update may change the columns it names and still be a HOT update. On 14 and 15, as with
+  any index there, an update that changes a column a surveyor names is not HOT, and building a
+  surveyor warns so.
 - **The table's count is left alone.** A build reports no count of rows, so the table's own count
   stays as `ANALYZE` or `VACUUM` left it.
 - **It is never in a plan.** No condition matches it and no plan reads it, so
@@ -486,16 +519,18 @@ question by question, pages first.
 
 ### Requirements
 
-PostgreSQL 18, Rust 1.96 or later and cargo-pgrx 0.19.2. On a server installed by a package manager,
-also its development package and libclang, which pgrx builds against; there `cargo pgrx install`
-takes `--sudo`, since the server's directories are the system's. It builds against
-`warren-pg-speller`, beside it in this repository. pgrx reads where your PostgreSQL is from
-`~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`); the second line below writes that file, and
-where it exists already, add the `pg18` line under its `[configs]` instead:
+PostgreSQL 14 to 18 (14.19, 15.14, 16.10, 17.6 or later), Rust 1.96 or later and cargo-pgrx 0.19.2.
+On 14 and 15, building a surveyor warns that an UPDATE changing one of its columns is no longer HOT.
+On a server installed by a package manager, also its development package and libclang, which pgrx
+builds against; there `cargo pgrx install` takes `--sudo`, since the server's directories are the
+system's. It builds against `warren-pg-speller`, beside it in this repository. pgrx reads where your
+PostgreSQL is from `~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`); the last line below writes
+that file, and where it exists already, add that `pg` line under its `[configs]` instead:
 
 ```sh
 PG_CONFIG=/path/to/pg_config
-mkdir -p ~/.pgrx && printf '[configs]\npg18 = "%s"\n' "$PG_CONFIG" > ~/.pgrx/config.toml
+PG_MAJOR=$("$PG_CONFIG" --version | awk '{print $2}' | cut -d. -f1)
+mkdir -p ~/.pgrx && printf '[configs]\npg%s = "%s"\n' "$PG_MAJOR" "$PG_CONFIG" > ~/.pgrx/config.toml
 ```
 
 `CREATE EXTENSION warren_surveyor_pg` takes a superuser: the extension is not trusted.
@@ -572,8 +607,8 @@ CREATE INDEX lego_sets_surveyor ON lego.lego_sets USING surveyor (set_num);
 - **`warren_surveyor_pg.planning_read_limit`** (integer, in pages, so `64MB` works; default `-1`;
   superuser only): lowers the budget to this many pages where the statement's tables hold more.
   `-1` sets no lower limit; `0` reads no index page and runs no recursive query while planning, so
-  nothing is measured, while the drive's weight, the price of B-trees from shared buffers and
-  grouping one value at a time still apply.
+  nothing is measured, while the drive's weight, the price of B-trees from shared buffers, the
+  cache counted as shared buffers and grouping one value at a time still apply.
 
 Once the library is loaded, every other name under `warren_surveyor_pg.` is refused.
 
@@ -613,6 +648,9 @@ writes it.
 - **`pg_dump` and restore.** A surveyor is dumped as its `CREATE INDEX … USING surveyor`, and
   restored without reading its table; the extension must be installed on the server restored to.
   The database's `session_preload_libraries` travels as any database setting does.
+- **`effective_cache_size`.** While a statement that reads a table with a surveyor is planned, a
+  setting above `shared_buffers` reads as `shared_buffers`, to the planner and to any extension
+  that prices paths, and as set again once planning ends.
 - **Security.** Measured statistics that hold a table's values are offered to the planner only
   where the user may read every row of the column, as PostgreSQL decides for its own statistics,
   row security and column privileges included. Counts alone, which hold no value, always are, and
@@ -624,12 +662,13 @@ writes it.
   method `surveyor`, with a comment `\dA+` shows;
 - 17 default operator classes for `surveyor`, each named for its type (`int4_ops`, `text_ops`, …),
   each with the B-tree's comparison function for its type and, for most, its sort support;
-- the domain `warren_key`, `text` under the collation `pg_c_utf8`: text that orders by code point
-  whatever the operating system's locale data. Where the schema has a `warren_key` already, it is
-  kept only where another extension made it as that same domain and a superuser owns it, since
-  whoever owns a type may attach a check to it; any other stops the install with `type
-  <schema>.warren_key exists, and is not a domain over text with collation pg_c_utf8 that an
-  extension made and a superuser owns`;
+- the domain `warren_key`, text that orders by code point whatever the operating system's locale
+  data: `text` under the collation `pg_c_utf8` from PostgreSQL 17, and under `"C"` before it, which
+  orders UTF-8 text the same way. Where the schema has a `warren_key` already, it is kept only where
+  another extension made it as that same domain and a superuser owns it, since whoever owns a type
+  may attach a check to it; any other stops the install with `type <schema>.warren_key exists, and
+  is not a domain over text with collation pg_c_utf8 that an extension made and a superuser owns`,
+  with `"C"` in place of `pg_c_utf8` before 17;
 - the settings `warren_surveyor_pg.walked_leaf_page_cost` and
   `warren_surveyor_pg.planning_read_limit`, registered when the library loads.
 
@@ -637,8 +676,8 @@ It creates no table, view or function for users to call.
 
 ### Upgrading
 
-This is version 0.1.0, the first, with no script for `ALTER EXTENSION … UPDATE`. A surveyor holds
-no page, so nothing on disk moves between versions. A new library goes in with
+This is version 0.1.1; `ALTER EXTENSION warren_surveyor_pg UPDATE` takes a 0.1.0 install to it.
+A surveyor holds no page, so nothing on disk moves between versions. A new library goes in with
 `cargo pgrx install`; a session loads it once, so reconnect (and restart, where it is in
 `shared_preload_libraries`). Where a release changes the extension's SQL, turn the surveyor off,
 drop and create the extension, and turn it on: nothing in that reads a table but `ANALYZE`. A
@@ -666,4 +705,10 @@ Copyright (C) 2026 Kenneth Allen Flegal
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU
 General Public License as published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version. See [LICENSE](LICENSE).
+License, or (at your option) any later version. See [LICENSE][LICENSE].
+
+[kit]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/kit/README.md
+[speller]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md
+[speller-catalog]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md#what-it-reads-from-the-catalog
+[respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#a-union-of-arms-that-read-one-roster---respell
+[LICENSE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-surveyor-pg/LICENSE

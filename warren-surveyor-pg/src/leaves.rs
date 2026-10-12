@@ -75,6 +75,7 @@
 //! count from its own leaves.
 
 use crate::closure;
+use crate::compat;
 use crate::measure::{self, End};
 use crate::query::{cells, every_row_analyzed, members, surveyed, surveyor_am};
 use crate::round;
@@ -879,7 +880,7 @@ unsafe fn read_vectors(
     let nulls = measure::rows_at(index, &block(false), &block(true), tuples, true, most)?;
     let mut used = nulls.pages;
     let kind = *(*btree).opcintype;
-    let stored = (*pg_sys::TupleDescAttr((*index).rd_att, 0)).atttypid;
+    let stored = (*compat::attribute((*index).rd_att, 0)).atttypid;
     let mut read = Vectors {
         tuples,
         nulls,
@@ -1481,10 +1482,15 @@ unsafe fn with_common(
         .iter()
         .map(|&s| (s as f32).into_datum().expect("a share is a value"))
         .collect();
-    let numbers = pg_sys::construct_array_builtin(
+    let (mut len, mut byval, mut align) = (0i16, false, 0 as c_char);
+    pg_sys::get_typlenbyvalalign(pg_sys::FLOAT4OID, &mut len, &mut byval, &mut align);
+    let numbers = pg_sys::construct_array(
         numbers.as_mut_ptr(),
         numbers.len() as i32,
         pg_sys::FLOAT4OID,
+        len as i32,
+        byval,
+        align,
     );
     set(
         pg_sys::Anum_pg_statistic_stanumbers1,
@@ -2075,13 +2081,14 @@ mod tests {
             estimated(query, ""),
             number("SELECT count(*) FROM listed WHERE cat = 7")
         );
-        let leaves = number(
+        let leaves = number(&format!(
             "SELECT count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('listed_cat_id', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('listed_cat_id', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '07 00 00 00%' \
                AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
-        );
+            crate::compat::page_stats("listed_cat_id")
+        ));
         assert!(leaves >= 6.0, "{leaves} leaves");
         let read = crate::conditions::tests::reads(query);
         let pages = read

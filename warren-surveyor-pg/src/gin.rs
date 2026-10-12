@@ -27,6 +27,7 @@
 //! The read stops once its pages would pass the pages of the table, or what is left of the
 //! statement's planning-read budget (`budget`), and its conditions are left to the planner.
 
+use crate::compat::{GinMetaPageData, GinPageOpaqueData};
 use crate::conditions::{compares_as, Held};
 use crate::overlap::Room;
 use crate::reading::{address, block_of, on_first_column, read, support_name, PageCopy};
@@ -156,10 +157,10 @@ impl Gin {
     /// metapage, or the read has read its most.
     pub(crate) unsafe fn pending(&mut self) -> Option<f64> {
         let page = self.page(METAPAGE)?;
-        if page.special::<pg_sys::GinPageOpaqueData>().flags & GIN_META == 0 {
+        if page.special::<GinPageOpaqueData>().flags & GIN_META == 0 {
             return None;
         }
-        let meta = std::ptr::read_unaligned(page.contents() as *const pg_sys::GinMetaPageData);
+        let meta = std::ptr::read_unaligned(page.contents() as *const GinMetaPageData);
         Some(meta.nPendingHeapTuples as f64)
     }
 
@@ -223,7 +224,7 @@ impl Gin {
             let mut page = self.page(block)?;
             // a page split after its parent was read holds the keys past its last on its right
             while block != ENTRY_ROOT {
-                let right = page.special::<pg_sys::GinPageOpaqueData>().rightlink;
+                let right = page.special::<GinPageOpaqueData>().rightlink;
                 let last = page.last();
                 if right == pg_sys::InvalidBlockNumber
                     || last < 1
@@ -234,7 +235,7 @@ impl Gin {
                 block = right;
                 page = self.page(block)?;
             }
-            let opaque = page.special::<pg_sys::GinPageOpaqueData>();
+            let opaque = page.special::<GinPageOpaqueData>();
             let (flags, rightmost) = (opaque.flags, opaque.rightlink == pg_sys::InvalidBlockNumber);
             let last = page.last();
             if last < 1 {
@@ -330,7 +331,7 @@ impl Gin {
             page = self.page(first)?;
         }
         loop {
-            let opaque = page.special::<pg_sys::GinPageOpaqueData>();
+            let opaque = page.special::<GinPageOpaqueData>();
             let (flags, right) = (opaque.flags, opaque.rightlink);
             if flags & GIN_DELETED == 0 {
                 leaf_addresses(&page, into)?;
@@ -523,12 +524,12 @@ impl Gin {
 }
 
 unsafe fn is_leaf(page: &PageCopy) -> bool {
-    page.special::<pg_sys::GinPageOpaqueData>().flags & GIN_LEAF != 0
+    page.special::<GinPageOpaqueData>().flags & GIN_LEAF != 0
 }
 
 /// The pages an internal page of a posting tree points down to, in order.
 unsafe fn children(page: &PageCopy) -> Vec<pg_sys::BlockNumber> {
-    let n = page.special::<pg_sys::GinPageOpaqueData>().maxoff as usize;
+    let n = page.special::<GinPageOpaqueData>().maxoff as usize;
     let items = page.contents().add(RIGHT_BOUND);
     (0..n)
         .map(|i| {
@@ -542,7 +543,7 @@ unsafe fn children(page: &PageCopy) -> Vec<pg_sys::BlockNumber> {
 
 /// The heap addresses a leaf of a posting tree holds.
 unsafe fn leaf_rows(page: &PageCopy) -> u64 {
-    let opaque = page.special::<pg_sys::GinPageOpaqueData>();
+    let opaque = page.special::<GinPageOpaqueData>();
     if opaque.flags & GIN_COMPRESSED == 0 {
         return opaque.maxoff as u64;
     }
@@ -631,7 +632,7 @@ unsafe fn listed_addresses(tuple: pg_sys::IndexTuple, into: &mut Gathered) -> Op
 /// The addresses a leaf of a posting tree holds, gathered `into`; none where they would pass its
 /// room.
 unsafe fn leaf_addresses(page: &PageCopy, into: &mut Gathered) -> Option<()> {
-    let opaque = page.special::<pg_sys::GinPageOpaqueData>();
+    let opaque = page.special::<GinPageOpaqueData>();
     let start = page.contents().add(RIGHT_BOUND);
     if opaque.flags & GIN_COMPRESSED == 0 {
         for i in 0..opaque.maxoff as usize {
@@ -1360,7 +1361,7 @@ mod tests {
             let rel = pg_sys::index_open(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             let mut gin = Gin::open(rel, u32::MAX).expect("a GIN of one column");
             let (mut output, mut varlena) = (pg_sys::InvalidOid, false);
-            let storage = (*pg_sys::TupleDescAttr((*rel).rd_att, 0)).atttypid;
+            let storage = (*crate::compat::attribute((*rel).rd_att, 0)).atttypid;
             pg_sys::getTypeOutputInfo(storage, &mut output, &mut varlena);
             // down the leftmost downlinks to the first entry leaf, then along the leaves
             let mut block = super::ENTRY_ROOT;
@@ -1390,7 +1391,7 @@ mod tests {
                     let tree = gin.tree(root).expect("a tree is counted");
                     out.push((text, root as i64, tree.rows, tree.leaves, tree.pages as i32));
                 }
-                block = page.special::<pg_sys::GinPageOpaqueData>().rightlink;
+                block = page.special::<crate::compat::GinPageOpaqueData>().rightlink;
             }
             pg_sys::index_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         }

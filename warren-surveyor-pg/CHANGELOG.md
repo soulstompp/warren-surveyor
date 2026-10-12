@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1
+
+- PostgreSQL 14, 15, 16 and 17 as well as 18, each a Cargo feature, `pg14` to `pg18`; `pg18` is the
+  default. The server must be 14.19, 15.14, 16.10, 17.6 or later.
+- On 14 and 15, building a surveyor warns that an UPDATE changing one of its columns is no longer
+  HOT. From 16 on, a surveyor never keeps an update from being HOT, as before.
+- Before 17, `warren_key` is collated by `"C"`, which orders UTF-8 text by code point as
+  `pg_c_utf8` does from 17 on.
+- Before 18, the B-trees are priced as that version prices them: with no skip scan, a path with no
+  condition on its leading column walks the whole index.
+- While a statement that reads a table with a surveyor is planned, `effective_cache_size` set above
+  `shared_buffers` reads as `shared_buffers`, and is put back after, an error included. The table
+  pages repeated lookups fetch are counted against the cache the surveyor prices its B-trees'
+  pages against, instead of the operating system's file cache besides.
+- Repeated scans of a B-tree hold its pages up to a lesser `effective_cache_size`, where one is set
+  below `shared_buffers`.
+- `ALTER EXTENSION warren_surveyor_pg UPDATE` takes a 0.1.0 install to 0.1.1.
+- The respelling of `warren-pg-speller` 0.1.2, installed with the library.
+
 ## 0.1.0
 
 The first release: the surveyor for PostgreSQL 18, an index that is never scanned and holds

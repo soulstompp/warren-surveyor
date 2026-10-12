@@ -31,6 +31,7 @@
 //! values. Where the prediction passes the pages of the table, or what is left of the statement's
 //! planning-read budget, the read never starts and the conditions are left to the planner.
 
+use crate::compat;
 use crate::leaves;
 use crate::measure::{self, End, Part};
 use crate::query::{bare, cells, distinct_of};
@@ -87,7 +88,7 @@ pub(crate) unsafe fn column_of(
         if key != 0 {
             if tag(expr) == pg_sys::NodeTag::T_Var {
                 let v = expr as *mut pg_sys::Var;
-                if (*v).varno == (*rel).relid as i32
+                if compat::varno(v) == (*rel).relid as i32
                     && (*v).varattno == key as i16
                     && (*v).varlevelsup == 0
                 {
@@ -526,7 +527,7 @@ unsafe fn key_expression(
             &mut typmod,
             &mut collation,
         );
-        return Some(pg_sys::makeVar(
+        return Some(compat::make_var(
             (*rel).relid as i32,
             key as pg_sys::AttrNumber,
             kind,
@@ -1230,10 +1231,11 @@ pub(crate) mod tests {
         Spi::run("CREATE EXTENSION IF NOT EXISTS pageinspect").unwrap();
         Spi::get_one::<i64>(&format!(
             "SELECT count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('{index}', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('{index}', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '02 00 00 00%' \
-               AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)"
+               AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
+            crate::compat::page_stats(index)
         ))
         .unwrap()
         .unwrap() as u32
@@ -1296,13 +1298,14 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap();
         Spi::run("CREATE EXTENSION IF NOT EXISTS pageinspect").unwrap();
-        let wide = Spi::get_one::<f64>(
+        let wide = Spi::get_one::<f64>(&format!(
             "SELECT 2000.0::float8 / count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('annotated_cat_id', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('annotated_cat_id', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '07 00 00 00%' \
                AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
-        )
+            crate::compat::page_stats("annotated_cat_id")
+        ))
         .unwrap()
         .unwrap();
         assert!(

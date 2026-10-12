@@ -1,0 +1,11 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Each theme with the theme at the top of its tree: one row per theme, keyed by theme_id.
+-- each theme's root
+WITH RECURSIVE root (theme_id, root_id) AS (
+    SELECT id, id FROM lego_themes WHERE parent_id IS NULL
+  UNION ALL
+    SELECT t.id, r.root_id FROM lego_themes t JOIN root r ON t.parent_id = r.theme_id
+)
+SELECT theme_id, root_id FROM root

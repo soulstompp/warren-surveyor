@@ -28,6 +28,7 @@
 //! be hashed leave the plan as the planner chose it. Relations of other kinds (a WITH query, a
 //! function) are not asked about.
 
+use crate::compat;
 use crate::query::{bare, btree_leading_columns, cells, members, surveyed, surveyor_am};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
@@ -113,7 +114,7 @@ unsafe fn classes(root: *mut pg_sys::PlannerInfo) -> Vec<Class> {
             }
             let var = e as *mut pg_sys::Var;
             if (*var).varlevelsup == 0 && (*var).varattno > 0 {
-                columns.push(((*var).varno as u32, (*var).varattno));
+                columns.push((compat::varno(var) as u32, (*var).varattno));
             }
         }
         out.push((columns, value));
@@ -403,7 +404,7 @@ unsafe fn hash_at_one_value(
     if !pg_sys::enable_hashagg
         || (*extra).flags & pg_sys::GROUPING_CAN_USE_HASH as i32 == 0
         || (*extra).patype != pg_sys::PartitionwiseAggregateType::PARTITIONWISE_AGGREGATE_NONE
-        || (*root).processed_groupClause.is_null()
+        || compat::group_clause(root).is_null()
         || !(*parse).groupingSets.is_null()
         || (*input_rel).cheapest_total_path.is_null()
     {
@@ -454,7 +455,7 @@ unsafe fn hash_at_one_value(
             (*grouped_rel).reltarget,
             pg_sys::AggStrategy::AGG_HASHED,
             pg_sys::AggSplit::AGGSPLIT_SIMPLE,
-            (*root).processed_groupClause,
+            compat::group_clause(root),
             (*extra).havingQual as *mut pg_sys::List,
             &costs,
             groups,

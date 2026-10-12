@@ -104,8 +104,9 @@ impl Drop for Round {
 
 /// Plans the statement `parse` through `plan`, inside a round. The outermost statement starts the
 /// budget its reads draw on (`budget`). The outermost statement that reads a table carrying a
-/// surveyor, whose drives are busy, is planned with its pages from the disk weighed by them
-/// (`drive`); outside a parallel operation, where settings cannot be made.
+/// surveyor is planned with the cache counted as shared buffers, and, where its drives are busy,
+/// with its pages from the disk weighed by them (`drive`); outside a parallel operation, where
+/// settings cannot be made.
 unsafe fn planned(
     parse: *mut pg_sys::Query,
     plan: impl FnOnce() -> *mut pg_sys::PlannedStmt,
@@ -118,12 +119,11 @@ unsafe fn planned(
     let heat = if outermost && !pg_sys::IsInParallelMode() {
         crate::drive::statement_weight(parse)
     } else {
-        1.0
+        None
     };
-    if heat > 1.0 {
-        crate::drive::planned_weighed(heat, plan)
-    } else {
-        plan()
+    match heat {
+        Some(heat) => crate::drive::planned_held(heat, plan),
+        None => plan(),
     }
 }
 

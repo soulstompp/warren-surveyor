@@ -46,6 +46,7 @@
 //! named where a page of the leaves begins, the first and last values of the key's leading column,
 //! and the share of the steps from one leaf to the next in key order that go to the next block.
 
+use crate::compat;
 use pgrx::pg_sys;
 use std::cmp::Ordering;
 
@@ -520,7 +521,7 @@ impl Order {
 
     /// Whether every column the index stores, in its key and its INCLUDE, is of one width.
     unsafe fn fixed_width(&self) -> bool {
-        (0..(*self.desc).natts).all(|i| (*pg_sys::TupleDescAttr(self.desc, i)).attlen > 0)
+        (0..(*self.desc).natts).all(|i| (*compat::attribute(self.desc, i)).attlen > 0)
     }
 
     /// Finds each column's comparison against the types `end` gives it: false where the operator
@@ -1331,7 +1332,7 @@ pub(crate) unsafe fn steps(
         return None;
     }
     let kind = order.columns[column].input;
-    let attr = pg_sys::TupleDescAttr(order.desc, column as i32);
+    let attr = compat::attribute(order.desc, column as i32);
     let (byval, len) = ((*attr).attbyval, (*attr).attlen as i32);
     let keep =
         |v: Option<pg_sys::Datum>| -> Part { v.map(|d| (pg_sys::datumCopy(d, byval, len), kind)) };
@@ -1835,13 +1836,14 @@ mod tests {
             m.rows
         );
         // the leaves the block lies on
-        let leaves = count(
+        let leaves = count(&format!(
             "SELECT count(DISTINCT s.blkno) \
-             FROM bt_multi_page_stats('striped_an', 1, -1) s, \
+             FROM {} s, \
                   LATERAL bt_page_items('striped_an', s.blkno::int) i \
              WHERE s.type = 'l' AND i.data LIKE '02 00 00 00%' \
                AND NOT (s.btpo_next <> 0 AND i.itemoffset = 1)",
-        );
+            crate::compat::page_stats("striped_an")
+        ));
         assert!(
             (m.leaves - leaves).abs() <= 1.0,
             "{} leaves measured, {leaves} counted, {m:?}",
@@ -2230,6 +2232,7 @@ mod tests {
             let rel = pg_sys::index_open(oid(index), index_lock);
             let mut info = pg_sys::IndexVacuumInfo {
                 index: rel,
+                #[cfg(not(any(feature = "pg14", feature = "pg15")))]
                 heaprel: heap,
                 analyze_only: false,
                 report_progress: false,
@@ -2462,9 +2465,12 @@ mod sessions {
             .unwrap();
             let dead: i64 = db
                 .query_one(
-                    "SELECT count(*) FROM bt_multi_page_stats('drained_k', 1, -1) s, \
-                         LATERAL bt_page_items('drained_k', s.blkno::int) i \
-                     WHERE s.type = 'l' AND i.dead",
+                    &format!(
+                        "SELECT count(*) FROM {} s, \
+                             LATERAL bt_page_items('drained_k', s.blkno::int) i \
+                         WHERE s.type = 'l' AND i.dead",
+                        crate::compat::page_stats("drained_k")
+                    ),
                     &[],
                 )
                 .unwrap()

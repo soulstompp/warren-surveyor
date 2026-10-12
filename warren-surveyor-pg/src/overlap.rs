@@ -34,6 +34,7 @@
 //! together where there are two or more of them; the others are counted one by one.
 
 use crate::carried;
+use crate::compat;
 use crate::conditions::{column_of, compares_as, constant, strategy};
 use crate::gin::Gin;
 use crate::query::cells;
@@ -504,11 +505,10 @@ unsafe fn btree(
         (*index).indexoid,
         pg_sys::AccessShareLock as pg_sys::LOCKMODE,
     );
-    let scan = pg_sys::index_beginscan(
+    let scan = compat::index_beginscan(
         heap,
         rel_index,
         std::ptr::addr_of_mut!(pg_sys::SnapshotAnyData),
-        null_mut(),
         keys.len() as i32,
         0,
     );
@@ -924,7 +924,8 @@ pub(crate) mod tests {
     fn leaves(index: &str) -> u32 {
         Spi::run("CREATE EXTENSION IF NOT EXISTS pageinspect").unwrap();
         Spi::get_one::<i64>(&format!(
-            "SELECT count(*) FROM bt_multi_page_stats('{index}', 1, -1) WHERE type = 'l'"
+            "SELECT count(*) FROM {} s WHERE s.type = 'l'",
+            crate::compat::page_stats(index)
         ))
         .unwrap()
         .unwrap() as u32

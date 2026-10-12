@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 [package]
 name = "warren-pg-speller"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Kenneth Allen Flegal"]
@@ -16,6 +16,10 @@ crate-type = ["rlib"]
 
 [features]
 default = ["pg18"]
+pg14 = ["pgrx/pg14"]
+pg15 = ["pgrx/pg15"]
+pg16 = ["pgrx/pg16"]
+pg17 = ["pgrx/pg17"]
 pg18 = ["pgrx/pg18"]
 pg19 = ["pgrx/pg19"]
 

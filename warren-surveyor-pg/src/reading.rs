@@ -5,6 +5,7 @@
 //! on the statement's planning-read budget (`budget`), a row's address as one number, and a
 //! relation's condition on an index's first column against a constant.
 
+use crate::compat;
 use crate::conditions::{column_of, constant, strategy};
 use crate::query::cells;
 use pgrx::pg_sys;
@@ -35,7 +36,7 @@ impl PageCopy {
 
     /// The page's WAL position.
     pub(crate) unsafe fn lsn(&self) -> u64 {
-        pg_sys::PageGetLSN(self.ptr())
+        compat::page_lsn(self.ptr())
     }
 
     /// The offset of the page's last item.

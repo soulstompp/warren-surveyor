@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! How busy the drive holding a tablespace is, read from the operating system while planning, and
-//! a statement planned with every page from the disk weighed by it.
+//! a statement planned with every page from the disk weighed by it and with the cache counted as
+//! shared buffers.
 //!
 //! The drive is the block device holding the tablespace's directory: the device `stat` names for
 //! it, found by its major and minor numbers in `/proc/diskstats`, as a partition or, where the
@@ -29,6 +30,13 @@
 //! shared buffers keeps its price, and a tablespace that declares its own page costs keeps them. A
 //! statement planned while another is being planned takes the settings as they stand.
 //!
+//! The same statement is planned with `effective_cache_size` at `shared_buffers` wherever it is set
+//! above them, on an idle drive as on a busy one, and it is put back after the planning in the same
+//! way. Where PostgreSQL counts the pages that repeated scans fetch, of a table or of an index, it
+//! shares that cache among the statement's tables by their pages (costsize.c:908-961, 18.6); the
+//! surveyor counts each index's own pages alone against the same cache (`price`). A cache set below
+//! shared buffers is kept.
+//!
 //! A drive's own page costs, measured on it, are declared on the tablespace that lies on it
 //! (`ALTER TABLESPACE … SET (seq_page_cost = …, random_page_cost = …)`), and not in the settings
 //! for the whole server. PostgreSQL prices the pages of every table and index in a tablespace by
@@ -39,6 +47,7 @@
 //! and is often deleted before the drive ever writes it, so a drive's price of a page read alone,
 //! declared on its tablespace, weighs the lookups that read from it and no spill.
 
+use crate::compat;
 use crate::query::surveyor_am;
 use crate::round;
 use pgrx::pg_sys;
@@ -75,13 +84,13 @@ pub(crate) unsafe fn weight(space: pg_sys::Oid) -> f64 {
     1.0 / (1.0 - busy_share(space).clamp(0.0, MOST_BUSY))
 }
 
-/// The weight a statement reading `parse` is planned with: 1 where no table it reads carries a
+/// The weight a statement reading `parse` is planned with: none where no table it reads carries a
 /// surveyor, and otherwise the highest of the database's own tablespace's drive's and of each
 /// such table's.
-pub(crate) unsafe fn statement_weight(parse: *mut pg_sys::Query) -> f64 {
+pub(crate) unsafe fn statement_weight(parse: *mut pg_sys::Query) -> Option<f64> {
     let am = surveyor_am();
     if am == pg_sys::InvalidOid || parse.is_null() {
-        return 1.0;
+        return None;
     }
     let mut named: Vec<(pg_sys::Oid, bool)> = Vec::new();
     named_walker(
@@ -90,10 +99,10 @@ pub(crate) unsafe fn statement_weight(parse: *mut pg_sys::Query) -> f64 {
     );
     let mut spaces = surveyed_spaces(named, am);
     if spaces.is_empty() {
-        return 1.0;
+        return None;
     }
     spaces.push(pg_sys::InvalidOid);
-    spaces.into_iter().map(|s| weight(s)).fold(1.0, f64::max)
+    Some(spaces.into_iter().map(|s| weight(s)).fold(1.0, f64::max))
 }
 
 unsafe fn oids(list: *mut pg_sys::List) -> Vec<pg_sys::Oid> {
@@ -223,7 +232,7 @@ unsafe fn carries_surveyor(
         }
         let index = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_index>(tuple);
         // an index being dropped is not read
-        if (*index).indislive && pg_sys::get_rel_relam((*index).indexrelid) == am {
+        if (*index).indislive && compat::get_rel_relam((*index).indexrelid) == am {
             carries = true;
             break;
         }
@@ -240,28 +249,41 @@ unsafe fn children_of(parent: pg_sys::Oid) -> Vec<pg_sys::Oid> {
     }))
 }
 
-/// Plans with `seq_page_cost`, `random_page_cost` and the walked-leaf price, where it is set, each
-/// multiplied by `heat`, and puts them back after, an error included.
-pub(crate) unsafe fn planned_weighed<T>(heat: f64, plan: impl FnOnce() -> T) -> T {
+/// Plans with `effective_cache_size` at `shared_buffers` where it is set above them, and, where
+/// `heat` is above 1, `seq_page_cost`, `random_page_cost` and the walked-leaf price, where it is
+/// set, each multiplied by `heat`; and puts them back after, an error included.
+pub(crate) unsafe fn planned_held<T>(heat: f64, plan: impl FnOnce() -> T) -> T {
+    let mut held: Vec<(&str, String)> = Vec::new();
+    let shared = crate::price::shared_buffers();
+    if shared < pg_sys::effective_cache_size as f64 {
+        held.push(("effective_cache_size", format!("{}", shared as i64)));
+    }
+    if heat > 1.0 {
+        let mut weighed = vec![
+            ("seq_page_cost", pg_sys::seq_page_cost),
+            ("random_page_cost", pg_sys::random_page_cost),
+        ];
+        let walked = crate::price::walked_leaf_page_cost();
+        if walked >= 0.0 {
+            weighed.push(("warren_surveyor_pg.walked_leaf_page_cost", walked));
+        }
+        for (name, value) in weighed {
+            // a cost set near its largest value is weighed to that value, which the setting takes
+            held.push((name, format!("{}", (value * heat).min(MOST_PAGE_COST))));
+        }
+    }
+    if held.is_empty() {
+        return plan();
+    }
     let nest = pg_sys::NewGUCNestLevel();
     let context = if pg_sys::superuser() {
         pg_sys::GucContext::PGC_SUSET
     } else {
         pg_sys::GucContext::PGC_USERSET
     };
-    let mut weighed = vec![
-        ("seq_page_cost", pg_sys::seq_page_cost),
-        ("random_page_cost", pg_sys::random_page_cost),
-    ];
-    let walked = crate::price::walked_leaf_page_cost();
-    if walked >= 0.0 {
-        weighed.push(("warren_surveyor_pg.walked_leaf_page_cost", walked));
-    }
-    for (name, value) in weighed {
+    for (name, value) in held {
         let name = CString::new(name).expect("a setting's name");
-        // a cost set near its largest value is weighed to that value, which the setting takes
-        let value =
-            CString::new(format!("{}", (value * heat).min(MOST_PAGE_COST))).expect("a number");
+        let value = CString::new(value).expect("a number");
         pg_sys::set_config_option(
             name.as_ptr(),
             value.as_ptr(),
@@ -499,7 +521,11 @@ pub(crate) mod tests {
             next(root, stage, input_rel, output_rel, extra);
         }
         for p in cells((*output_rel).pathlist) {
-            let path = p as *mut pg_sys::Path;
+            let mut path = p as *mut pg_sys::Path;
+            // a path under a projection is read through it
+            if (*path).type_ == pg_sys::NodeTag::T_ProjectionPath {
+                path = (*(path as *mut pg_sys::ProjectionPath)).subpath;
+            }
             let (kind, under) = match (*path).type_ {
                 pg_sys::NodeTag::T_SortPath => (
                     "sort".to_string(),
@@ -670,10 +696,11 @@ pub(crate) mod tests {
 
     thread_local! {
         static SEEN_COSTS: RefCell<Vec<(f64, f64, f64)>> = const { RefCell::new(Vec::new()) };
+        static SEEN_CACHE: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
     }
     static mut NEXT_PATHLIST: pg_sys::set_rel_pathlist_hook_type = None;
 
-    /// Records the page costs in force while a relation's paths are made.
+    /// Records the page costs and the cache in force while a relation's paths are made.
     #[pg_guard]
     unsafe extern "C-unwind" fn record_costs(
         root: *mut pg_sys::PlannerInfo,
@@ -691,11 +718,13 @@ pub(crate) mod tests {
                 crate::price::walked_leaf_page_cost(),
             ))
         });
+        SEEN_CACHE.with(|s| s.borrow_mut().push(pg_sys::effective_cache_size));
     }
 
     /// The page costs in force while `query` was planned.
     fn costs_while_planning(query: &str) -> Vec<(f64, f64, f64)> {
         SEEN_COSTS.with(|s| s.borrow_mut().clear());
+        SEEN_CACHE.with(|s| s.borrow_mut().clear());
         unsafe {
             NEXT_PATHLIST = pg_sys::set_rel_pathlist_hook;
             pg_sys::set_rel_pathlist_hook = Some(record_costs);
@@ -764,6 +793,59 @@ pub(crate) mod tests {
         Spi::run("RESET warren_surveyor_pg.walked_leaf_page_cost").unwrap();
         for costs in busy(0.5, || costs_while_planning("SELECT id FROM watched")) {
             assert_eq!(costs, (3.0, 12.0, -1.0));
+        }
+    }
+
+    /// The cache counted while `query` was planned, in pages, as each relation's paths were made.
+    fn cache_while_planning(query: &str) -> Vec<i32> {
+        costs_while_planning(query);
+        SEEN_CACHE.with(|s| s.borrow().clone())
+    }
+
+    #[pg_test]
+    fn a_statement_reading_a_table_carrying_a_surveyor_counts_the_cache_as_shared_buffers() {
+        Spi::run(
+            "CREATE TABLE watched AS SELECT g AS id FROM generate_series(1, 1000) g; \
+             CREATE INDEX watched_order ON watched USING surveyor (id); \
+             CREATE TABLE unwatched AS SELECT g AS id FROM generate_series(1, 1000) g; \
+             ANALYZE watched; ANALYZE unwatched; \
+             SET LOCAL effective_cache_size = '4GB'",
+        )
+        .unwrap();
+        let (server, shared) = unsafe { (pg_sys::effective_cache_size, pg_sys::NBuffers) };
+        assert!(shared < server, "{shared} {server}");
+        for (query, cache) in [
+            ("SELECT id FROM watched WHERE id < 10", shared),
+            (
+                "SELECT u.id FROM unwatched u JOIN watched w ON w.id = u.id",
+                shared,
+            ),
+            ("SELECT id FROM unwatched WHERE id < 10", server),
+            (
+                "SELECT id FROM unwatched WHERE id IN (SELECT id FROM watched)",
+                shared,
+            ),
+        ] {
+            // on an idle drive and on a busy one
+            for share in [0.0, 0.5] {
+                let seen = busy(share, || cache_while_planning(query));
+                assert!(!seen.is_empty(), "{query}");
+                for counted in seen {
+                    assert_eq!(counted, cache, "{share} {query}");
+                }
+                assert_eq!(unsafe { pg_sys::effective_cache_size }, server);
+                assert_eq!(
+                    texts("SELECT current_setting('effective_cache_size')"),
+                    vec!["4GB".to_string()]
+                );
+            }
+        }
+        // a cache set below shared buffers is kept
+        Spi::run("SET LOCAL effective_cache_size = '64MB'").unwrap();
+        let below = unsafe { pg_sys::effective_cache_size };
+        assert!(below < shared, "{below} {shared}");
+        for counted in cache_while_planning("SELECT id FROM watched WHERE id < 10") {
+            assert_eq!(counted, below);
         }
     }
 
@@ -863,18 +945,25 @@ pub(crate) mod tests {
         )
         .unwrap();
         let before = costs_now();
-        // a statement whose planning fails, folding a division by zero
-        let failed = busy(0.5, || unsafe {
+        let cache = unsafe { pg_sys::effective_cache_size };
+        assert!(unsafe { pg_sys::NBuffers } < cache, "{cache}");
+        // a statement whose planning fails, on an idle drive and on a busy one
+        for share in [0.0, 0.5] {
+            assert!(the_planning_fails(share), "{share}");
+            assert_eq!(costs_now(), before, "{share}");
+            assert_eq!(unsafe { pg_sys::effective_cache_size }, cache, "{share}");
+            assert_eq!(crate::round::depth(), 0);
+        }
+    }
+
+    /// Whether planning a statement that folds a division by zero failed, every drive busy for
+    /// `share` of the time.
+    fn the_planning_fails(share: f64) -> bool {
+        busy(share, || unsafe {
             let text = CString::new("SELECT 1 / 0 FROM watched").unwrap();
             let raw = pg_sys::pg_parse_query(text.as_ptr());
             let stmt = (*(*raw).elements).ptr_value as *mut pg_sys::RawStmt;
-            let queries = pg_sys::pg_analyze_and_rewrite_fixedparams(
-                stmt,
-                text.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null_mut(),
-            );
+            let queries = crate::compat::analyze_and_rewrite(stmt, text.as_ptr());
             let query = (*(*queries).elements).ptr_value as *mut pg_sys::Query;
             let context = pg_sys::CurrentMemoryContext;
             let failed = PgTryBuilder::new(|| {
@@ -894,10 +983,7 @@ pub(crate) mod tests {
             .execute();
             pg_sys::CurrentMemoryContext = context;
             failed
-        });
-        assert!(failed);
-        assert_eq!(costs_now(), before);
-        assert_eq!(crate::round::depth(), 0);
+        })
     }
 
     /// 20,000 purchases of parts 1 to 60,000, a surveyor on them, and 60,000 parts written

@@ -1,0 +1,24 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Bricks bought per home zone, root theme, part category and colour, in the Decembers of 2016 to
+# 2020: the twenty with the most, with the purchases that brought them.
+-- Bricks bought per home zone, root theme, part category and colour, Decembers 2016 to 2020
+SELECT inv.home_zone, rt.name AS root_theme, pc.name AS category, col.name AS colour,
+       count(DISTINCT inv.purchase_id) AS purchases,
+       sum(ip.quantity * inv.copies)::integer AS bricks
+FROM (
+    :compose(shared/bricks.sqlc, @bought = bought/decembers_2016_2020.sqlc)
+) inv
+JOIN lego_sets s             ON s.set_num = inv.set_num
+JOIN (
+    :compose(shared/roots.sqlc)
+) r                          ON r.theme_id = s.theme_id
+JOIN lego_themes rt          ON rt.id = r.root_id
+JOIN lego_inventory_parts ip ON ip.inventory_id = inv.inventory_id
+JOIN lego_parts pt           ON pt.part_num = ip.part_num
+JOIN lego_part_categories pc ON pc.id = pt.part_cat_id
+JOIN lego_colors col         ON col.id = ip.color_id
+GROUP BY 1, 2, 3, 4
+ORDER BY bricks DESC, 1, 2, 3, 4
+LIMIT 20;

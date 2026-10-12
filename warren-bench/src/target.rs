@@ -182,6 +182,31 @@ pub struct Target {
     /// Each (key, value); an empty value is recorded as null.
     pub config: Vec<(String, String)>,
     pub config_id: String,
+    /// How the timed session gets the plan it executes each question by.
+    pub plan: PlanSent,
+}
+
+/// How the timed session gets the plan the server executes a question by: `auto_explain` sends it
+/// as a notice when the statement ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanSent {
+    /// The session loads `auto_explain` when it opens.
+    Loaded,
+    /// Every session has `auto_explain` loaded already.
+    Preloaded,
+    /// The server does not send it, for this reason.
+    Not(String),
+}
+
+impl PlanSent {
+    /// As the targets file records it.
+    pub fn word(&self) -> String {
+        match self {
+            PlanSent::Loaded => "auto_explain, loaded by the timed session".into(),
+            PlanSent::Preloaded => "auto_explain, preloaded".into(),
+            PlanSent::Not(why) => format!("none: {why}"),
+        }
+    }
 }
 
 impl Target {
@@ -697,7 +722,11 @@ async fn describe_pg(
 
 /// A fingerprint of a configuration, leaving out what describes this program's own session.
 pub fn config_id(config: &[(String, String)]) -> String {
-    let own = ["setting.application_name", "setting.statement_timeout"];
+    let own = [
+        "setting.application_name",
+        "setting.statement_timeout",
+        "timed_plan",
+    ];
     let parts: Vec<Vec<u8>> = config
         .iter()
         .filter(|(k, _)| !own.contains(&k.as_str()))
@@ -857,5 +886,9 @@ mod tests {
         assert_eq!(config_id(&a), config_id(&b));
         b[0].1 = "y".into();
         assert_ne!(config_id(&a), config_id(&b));
+        // how the timed session gets its plan is this program's session too
+        let mut c = a.clone();
+        c.push(("timed_plan".to_string(), "none: no".to_string()));
+        assert_eq!(config_id(&a), config_id(&c));
     }
 }

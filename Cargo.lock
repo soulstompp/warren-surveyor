@@ -2875,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "warren-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2892,14 +2892,14 @@ dependencies = [
 
 [[package]]
 name = "warren-pg-speller"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pgrx",
 ]
 
 [[package]]
 name = "warren-surveyor-pg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pgrx",
  "pgrx-bench",

@@ -31,6 +31,7 @@
 //! statement's planning ends.
 
 use crate::budget;
+use crate::compat;
 use crate::measure;
 use crate::query::{bare, cells, surveyed, surveyor_am};
 use crate::round;
@@ -580,7 +581,7 @@ unsafe fn count(
     pg_sys::ExecutorStart(desc, 0);
     let mut rows = 0;
     let (within, over) = loop {
-        pg_sys::ExecutorRun(desc, pg_sys::ScanDirection::ForwardScanDirection, 1);
+        compat::executor_run(desc, 1);
         let got = (*(*desc).estate).es_processed;
         rows += got;
         let over = pages_read() - start > left as i64;
@@ -653,7 +654,7 @@ unsafe extern "C-unwind" fn receive(
             match value {
                 Some(v) => {
                     *counts.entry(v).or_insert(0) += 1;
-                    if counts.len() > pg_sys::MAX_STATISTICS_TARGET as usize {
+                    if counts.len() > compat::MAX_STATISTICS_TARGET {
                         column.counts = None;
                     }
                 }

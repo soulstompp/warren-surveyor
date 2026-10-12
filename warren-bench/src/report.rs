@@ -72,6 +72,77 @@ pub const RESULTS: Declared = Declared {
         ("witness_other_relations", Kind::Text),
         ("plan_other_relations", Kind::Text),
         ("explain_other_relations", Kind::Text),
+        ("plan_moved", Kind::Bool),
+        ("timed_plan", Kind::Text),
+        ("explain_plan", Kind::Text),
+        ("error", Kind::Text),
+    ],
+    key: &["question", "target", "phase", "rep"],
+};
+
+/// The results as written before the timed execution sent its own plan: read, never written.
+pub const RESULTS_V3: Declared = Declared {
+    name: "results (before the timed execution sent its plan)",
+    columns: &[
+        ("target", Kind::Text),
+        ("config_id", Kind::Text),
+        ("question", Kind::Text),
+        ("spelling", Kind::Text),
+        ("selection", Kind::Text),
+        ("phase", Kind::Text),
+        ("rep", Kind::Int),
+        ("session", Kind::Int),
+        ("position", Kind::Int),
+        ("status", Kind::Text),
+        ("verdict", Kind::Text),
+        ("wall_ms", Kind::Float),
+        ("rows", Kind::Int),
+        ("digest", Kind::Text),
+        ("expected_rows", Kind::Int),
+        ("expected_digest", Kind::Text),
+        ("peak_rss_kb", Kind::Int),
+        ("peak_anon_kb", Kind::Int),
+        ("explain_status", Kind::Text),
+        ("planning_ms", Kind::Float),
+        ("execution_ms", Kind::Float),
+        ("explain_rows", Kind::Float),
+        ("explain_rows_ok", Kind::Bool),
+        ("shared_hit", Kind::Int),
+        ("shared_read", Kind::Int),
+        ("shared_dirtied", Kind::Int),
+        ("shared_written", Kind::Int),
+        ("temp_read", Kind::Int),
+        ("temp_written", Kind::Int),
+        ("planning_shared_hit", Kind::Int),
+        ("planning_shared_read", Kind::Int),
+        ("planner_memory_used_kb", Kind::Int),
+        ("planner_memory_allocated_kb", Kind::Int),
+        ("jit_ms", Kind::Float),
+        ("workers_launched", Kind::Int),
+        ("leaves_planned", Kind::Int),
+        ("leaves_executed", Kind::Int),
+        ("leaf_scans", Kind::Int),
+        ("other_scans", Kind::Int),
+        ("subplans_removed", Kind::Int),
+        ("leaf_set", Kind::Text),
+        ("explain_peak_rss_kb", Kind::Int),
+        ("plan_rows", Kind::Float),
+        ("explain_leaf_rows_read", Kind::Float),
+        ("explain_other_rows_read", Kind::Float),
+        ("witness_status", Kind::Text),
+        ("witness_leaves", Kind::Int),
+        ("witness_leaf_rows_read", Kind::Int),
+        ("witness_leaf_blocks", Kind::Int),
+        ("witness_other_rows_read", Kind::Int),
+        ("witness_other_blocks", Kind::Int),
+        ("plan_leaf_rows_read", Kind::Int),
+        ("plan_other_rows_read", Kind::Int),
+        ("rows_read_agree", Kind::Bool),
+        ("leaves_agree", Kind::Bool),
+        ("leaves_disagreement", Kind::Text),
+        ("witness_other_relations", Kind::Text),
+        ("plan_other_relations", Kind::Text),
+        ("explain_other_relations", Kind::Text),
         ("error", Kind::Text),
     ],
     key: &["question", "target", "phase", "rep"],
@@ -699,6 +770,31 @@ pub fn disagreements(t: &Table) -> Vec<String> {
         .collect()
 }
 
+/// The repetitions whose EXPLAIN's session planned another tree than the timed execution ran by,
+/// one line each, saying where the two plans part. Their rows are not compared.
+pub fn moved(t: &Table) -> Vec<String> {
+    t.rows
+        .iter()
+        .filter(|r| get(r, "plan_moved") == "true")
+        .map(|r| {
+            let plan = |k: &str| serde_json::from_str::<serde_json::Value>(get(r, k)).ok();
+            let part = match (plan("timed_plan"), plan("explain_plan")) {
+                (Some(a), Some(b)) => crate::explain::parting(&a, &b)
+                    .map(|p| format!("the plans part {p}"))
+                    .unwrap_or_else(|| "the plans recorded are the same tree".into()),
+                _ => "the plans recorded cannot be read".into(),
+            };
+            format!(
+                "{} {} {} rep {}: {part}",
+                get(r, "question"),
+                get(r, "target"),
+                get(r, "phase"),
+                get(r, "rep"),
+            )
+        })
+        .collect()
+}
+
 /// How many finished repetitions had a witness that was not OK, by its status. The law is not asked
 /// of those.
 pub fn unwitnessed(t: &Table) -> BTreeMap<String, usize> {
@@ -935,6 +1031,52 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_plan_that_moved_is_listed_with_where_its_plans_part_and_is_no_disagreement() {
+        let row = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let plan = |scan: &str, index: Option<&str>| {
+            let mut a = serde_json::json!({"Node Type": scan, "Relation Name": "a", "Schema": "s"});
+            if let Some(ix) = index {
+                a["Index Name"] = ix.into();
+            }
+            serde_json::json!({"Node Type": "Hash Join", "Plans": [
+                {"Node Type": "Seq Scan", "Relation Name": "b", "Schema": "s"}, a]})
+            .to_string()
+        };
+        let (timed, explain) = (
+            plan("Seq Scan", None),
+            plan("Index Only Scan", Some("a_idx")),
+        );
+        let t = Table {
+            rows: vec![
+                row(&[
+                    ("question", "q"),
+                    ("target", "t@all"),
+                    ("phase", "cold"),
+                    ("rep", "0"),
+                    ("plan_moved", "true"),
+                    ("timed_plan", &timed),
+                    ("explain_plan", &explain),
+                    ("rows_read_agree", ""),
+                    ("leaves_agree", ""),
+                ]),
+                row(&[("plan_moved", "false"), ("rows_read_agree", "true")]),
+                row(&[("rows_read_agree", "true")]),
+            ],
+        };
+        assert_eq!(
+            moved(&t),
+            ["q t@all cold rep 0: the plans part at node 3, Seq Scan on s.a in the timed execution \
+              and Index Only Scan using a_idx on s.a in its EXPLAIN"]
+        );
+        assert!(disagreements(&t).is_empty());
     }
 
     #[test]

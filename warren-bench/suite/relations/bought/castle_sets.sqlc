@@ -1,0 +1,10 @@
+-- Copyright (c) 2026 Kenneth Allen Flegal
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Castle's sets: one row per set of Castle or of a theme below it, keyed by set_num.
+-- Castle's sets
+SELECT s.set_num
+FROM (
+    :compose(shared/castle.sqlc)
+) castle
+JOIN lego_sets s ON s.theme_id = castle.id

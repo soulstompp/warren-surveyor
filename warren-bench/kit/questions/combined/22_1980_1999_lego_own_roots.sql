@@ -1,7 +1,7 @@
 -- Copyright (c) 2026 Kenneth Allen Flegal
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 
--- Sets released from 1980 to 1999 under LEGO's own themes, per root theme
+-- Sets released from 1980 to 1999 under in-house themes, licensed ones left out, per root theme
 WITH RECURSIVE root (theme_id, root_id) AS (
     SELECT t.id, t.id FROM lego_themes t WHERE t.parent_id IS NULL
   UNION ALL

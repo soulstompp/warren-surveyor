@@ -2,13 +2,14 @@
 # Copyright (c) 2026 Kenneth Allen Flegal
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
-# The whole kit in one command, from this clone, on the machine your PostgreSQL 18 server runs on:
+# The whole kit in one command, from this clone, on the machine your PostgreSQL server, 14 to 18,
+# runs on:
 #
 #   kit/run.sh --db postgres://USER@HOST:5432/lego --pg-config /path/to/pg_config
 #
 # It checks everything first and changes nothing until every check holds. Then it builds the bench,
 # installs the surveyor's extension into that server, makes the database --db names (it refuses
-# one that exists), loads the LEGO catalogue and the trapped database into it, records every
+# one that exists), loads the real catalogue and the trapped database into it, records every
 # answer with PostgreSQL alone, times every question with PostgreSQL alone, turns the surveyor on,
 # times every question again with it and without it, turns it off, and prints where the results
 # are. Everything it writes stays in this clone, but the extension's files, which go where the
@@ -82,7 +83,14 @@ for tool in psql curl cargo; do
 done
 [ -x "$PG_CONFIG" ] || die "--pg-config $PG_CONFIG is not an executable pg_config"
 pg_version=$("$PG_CONFIG" --version)
-case "$pg_version" in "PostgreSQL 18."*) ;; *) die "$PG_CONFIG is $pg_version; the surveyor needs PostgreSQL 18" ;; esac
+pg_number=$(printf '%s' "$pg_version" | awk '{print $2}')
+pg_major=${pg_number%%.*} pg_minor=${pg_number#*.}
+# the first release of each version whose planner checks that the user may read every row of a
+# table before it reads the table's statistics
+case "$pg_major" in 14) least=19 ;; 15) least=14 ;; 16) least=10 ;; 17) least=6 ;; 18) least=0 ;;
+    *) die "$PG_CONFIG is $pg_version; the surveyor needs PostgreSQL 14 to 18" ;; esac
+case "$pg_minor" in ''|*[!0-9]*) die "$PG_CONFIG is $pg_version; the surveyor needs a release of PostgreSQL 14 to 18" ;; esac
+[ "$pg_minor" -ge "$least" ] || die "$PG_CONFIG is $pg_version; the surveyor needs PostgreSQL $pg_major.$least or later"
 cargo pgrx --version 2>/dev/null | grep -q '0\.19\.2' \
     || die "cargo-pgrx 0.19.2 is needed: cargo install cargo-pgrx --version 0.19.2 --locked"
 server=$(q -d "$ADMIN" -c "SELECT current_setting('server_version') || '|' || (SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user)") \
@@ -90,11 +98,10 @@ server=$(q -d "$ADMIN" -c "SELECT current_setting('server_version') || '|' || (S
 server_version=${server%%|*}
 [ "${server#*|}" = true ] || die "the URL's user is not a superuser: the extension and the preload setting need one"
 server_number=${server_version%% *}
-pg_number=$(printf '%s' "$pg_version" | awk '{print $2}')
 [ "$server_number" = "$pg_number" ] \
     || die "the server is $server_version but $PG_CONFIG is $pg_version: give the pg_config of the server --db names, on its machine"
 contrib=$(q -d "$ADMIN" -c "SELECT count(*) FROM pg_available_extensions WHERE name IN ('cube', 'earthdistance', 'pg_trgm')")
-[ "$contrib" = 3 ] || die "the server lacks cube, earthdistance or pg_trgm: install PostgreSQL 18's contrib package"
+[ "$contrib" = 3 ] || die "the server lacks cube, earthdistance or pg_trgm: install PostgreSQL $pg_major's contrib package"
 exists=$(q -d "$ADMIN" -c "SELECT count(*) FROM pg_database WHERE datname = '$DB_NAME'")
 [ "$exists" = 0 ] || die "the database $DB_NAME exists: the kit makes its own and touches no other; name a new one in --db, or drop it yourself"
 data_dir=$(q -d "$ADMIN" -c "SHOW data_directory")
@@ -111,6 +118,7 @@ fact date "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fact commit "$(git -C "$REPO" log -1 --format='%h %s' 2>/dev/null || echo unknown)"
 fact server "PostgreSQL $server_version"
 fact size "$SIZE"
+[ "$pg_major" -ge 15 ] || printf 'on PostgreSQL 14 the bench runs without its rows witness, which needs 15\n'
 printf 'every check holds; results go to %s\n' "$OUT"
 
 # Install: the bench in this clone, the generator, the extension into the server.
@@ -118,11 +126,12 @@ STEP='install'
 say "install: the bench, in this clone"
 cargo build --release --locked -p warren-bench --manifest-path "$REPO/Cargo.toml"
 fact bench "$("$B" --version)"
-if command -v sqlc-brickgen >/dev/null; then
+# The generator on PATH serves if it takes --extension-schema, as 0.0.2 and later do.
+if command -v sqlc-brickgen >/dev/null && sqlc-brickgen --help | grep -q -- '--extension-schema'; then
     GEN=$(command -v sqlc-brickgen)
 else
-    say "install: the generator, sqlc-brickgen, from crates.io into $TOOLS"
-    cargo install --locked sqlc-brickgen --root "$TOOLS"
+    say "install: the generator, sqlc-brickgen 0.0.2, from crates.io into $TOOLS"
+    cargo install --locked sqlc-brickgen --version 0.0.2 --root "$TOOLS"
     GEN="$TOOLS/bin/sqlc-brickgen"
 fi
 if [ "$GEN" = "$TOOLS/bin/sqlc-brickgen" ]; then
@@ -132,7 +141,7 @@ else
 fi
 say "install: the extension, into the server's own directories"
 mkdir -p "$PGRX_HOME"
-printf '[configs]\npg18 = "%s"\n' "$PG_CONFIG" > "$PGRX_HOME/config.toml"
+printf '[configs]\npg%s = "%s"\n' "$pg_major" "$PG_CONFIG" > "$PGRX_HOME/config.toml"
 (cd "$REPO/warren-surveyor-pg" && cargo pgrx install --release --pg-config "$PG_CONFIG" $SUDO)
 fact extension "$(q -d "$ADMIN" -c "SELECT name || ' ' || default_version FROM pg_available_extensions WHERE name = 'warren_surveyor_pg'")"
 
@@ -146,7 +155,7 @@ tables=$(q -d "$DB" -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'publi
 [ "$tables" = 8 ] || die "the catalogue's download left $tables tables, not 8"
 started=$SECONDS
 "$GEN" --database-url "$DB" --size "$SIZE" --oo-schema lego_oo --partitioning inheritance,range,hash \
-    > "$OUT/generator.log" 2>&1
+    --extension-schema public > "$OUT/generator.log" 2>&1
 fact load_seconds $((SECONDS - started))
 fact database_size "$(q -d "$DB" -c "SELECT pg_size_pretty(pg_database_size(current_database()))")"
 
