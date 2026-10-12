@@ -369,7 +369,10 @@ pages again from outside shared buffers, loop after loop, wins on paper.
 made with `effective_cache_size` at `shared_buffers`, where it is set above them: the table pages
 that lookups fetch again, and the index pages of every kind of index, are counted against the cache
 the surveyor prices its B-trees' pages against. The setting is put back when planning ends, an error
-included.
+included. On a 3.2 GB database, sqlc-brickgen's `small`, with shared buffers at 128 MB,
+warren-bench's suite question `bricks/purchases_decembers_2016_2020` read 37,889 pages from outside
+shared buffers in 2,089 ms with the cache counted at its 4 GB default, and 2,629 in 987 ms with it
+counted at shared buffers.
 
 **Where it stops.** A cache set below shared buffers is kept, and nothing is set inside a parallel
 operation. PostgreSQL credits a table's order to a scan of its index only in part, so a walk of a
