@@ -12,6 +12,8 @@
   counted as a file the templates did not compose.
 - The kit's questions that put others together are in `combined/`, so their names begin
   `combined/`; they were in `composed/`.
+- Question 25, which puts most of the others in one, is in `in_one/`, so its name begins
+  `in_one/`; it was in `proof/`.
 - `suite/` holds the kit's 25 questions as `.sqlc` templates, each composing to the kit's own
   question byte for byte, and four more that join a question's rows to the bricks they brought,
   with the relations they compose in `suite/relations`, read with `--search-path`.
