@@ -193,14 +193,14 @@ fn quoted_text(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// The condition `clause` as the snail reads it, of the foreign table whose columns are `columns`
-/// over the snail's `table`; none where PostgreSQL keeps it.
+/// The condition `clause` as the snail reads it, and the column it is on, of the foreign table whose
+/// columns are `columns` over the snail's `table`; none where PostgreSQL keeps it.
 pub(crate) unsafe fn condition(
     clause: *mut pg_sys::Expr,
     relid: pg_sys::Index,
     columns: &[(i16, String, pg_sys::Oid, i32)],
     table: &Table,
-) -> Option<String> {
+) -> Option<(String, i16)> {
     let clause = clause as *mut pg_sys::Node;
     if (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
         return None;
@@ -279,7 +279,7 @@ pub(crate) unsafe fn condition(
             },
         ),
     };
-    Some(format!("{lhs} {operator} {literal}"))
+    Some((format!("{lhs} {operator} {literal}"), attno))
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -548,16 +548,76 @@ pub(crate) mod tests {
         );
     }
 
-    /// The planner is told the most rows the snail's counts allow for the conditions it reads.
+    /// The planner is told, of the rows known before the scan runs, those `warren_snail.rows` names:
+    /// the most the counts allow, the snail's estimate, PostgreSQL's held between the two bounds, or
+    /// the snail's estimate with PostgreSQL's share where it holds no key, which it is unless set.
     #[pg_test]
-    fn the_planner_is_told_the_rows_the_counts_allow() {
+    fn the_planner_is_told_the_rows_the_setting_names() {
         let path = events();
+        // Analyzed, so that PostgreSQL's estimate lies inside the bounds rather than past them.
+        Spi::run("ANALYZE mounted.events").unwrap();
         let question = "SELECT \"id\" FROM \"shop\".\"events\" WHERE \"id\" < 50";
         let price = Snail::open(&path).unwrap().price(question, None).unwrap();
-        let plan = texts("EXPLAIN SELECT id FROM mounted.events WHERE id < 50");
+        assert!(price.rows_low < price.rows_high, "{price:?}");
+        let rows_of = |condition: &str| -> (u64, Vec<String>) {
+            let plan = texts(&format!(
+                "EXPLAIN SELECT id FROM mounted.events WHERE {condition}"
+            ));
+            let rows = plan[0]
+                .split(" rows=")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .unwrap()
+                .parse()
+                .unwrap();
+            (rows, plan)
+        };
+        let told_where = |setting: &str, condition: &str| -> (u64, Vec<String>) {
+            Spi::run(&format!("SET LOCAL warren_snail.rows = {setting}")).unwrap();
+            rows_of(condition)
+        };
+        let told = |setting: &str| told_where(setting, "id < 50");
+        let off = "kind = 'Z'";
+        // Unless set, the planner is told what `mixed` tells it.
+        let unset = (rows_of("id < 50").0, rows_of(off).0);
+        assert_eq!(
+            Spi::get_one::<String>("SELECT current_setting('warren_snail.rows')")
+                .unwrap()
+                .as_deref(),
+            Some("mixed")
+        );
+        let (high, plan) = told("high");
+        assert_eq!(high, price.rows_high, "{plan:#?}");
+        let (estimate, plan) = told("counts");
+        assert_eq!(estimate, price.rows_estimate.max(1), "{plan:#?}");
         assert!(
-            plan[0].contains(&format!(" rows={} ", price.rows_high)),
-            "{price:?}: {plan:#?}"
+            plan.iter()
+                .any(|l| l.trim_start() == format!("Snail Rows Told: {estimate}")),
+            "{plan:#?}"
+        );
+        let (statistics, plan) = told("statistics");
+        let shown: u64 = plan
+            .iter()
+            .find_map(|l| l.trim_start().strip_prefix("Statistics Rows: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            statistics,
+            shown.clamp(price.rows_low, price.rows_high).max(1),
+            "{plan:#?}"
+        );
+        // Mixed: with every condition keyed, the snail's estimate; with only text off the levels,
+        // the whole table at PostgreSQL's share, which is PostgreSQL's estimate.
+        assert_eq!(told("mixed").0, estimate);
+        let (mixed, plan) = told_where("mixed", off);
+        assert_eq!(unset, (estimate, mixed), "{plan:#?}");
+        assert_eq!(mixed, told_where("statistics", off).0, "{plan:#?}");
+        assert!(mixed < told_where("counts", off).0, "{plan:#?}");
+        let e = crate::tests::refusal("SET LOCAL warren_snail.rows = most", None);
+        assert!(
+            e.as_deref().is_some_and(|e| e.contains("invalid value")),
+            "{e:?}"
         );
     }
 }

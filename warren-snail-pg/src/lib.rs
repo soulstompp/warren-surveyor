@@ -18,6 +18,12 @@ mod scan;
 
 ::pgrx::pg_module_magic!(name, version);
 
+/// The wrapper's settings, defined as the library loads.
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    scan::init();
+}
+
 extension_sql!(
     r#"
 CREATE FUNCTION warren_snail_handler() RETURNS fdw_handler

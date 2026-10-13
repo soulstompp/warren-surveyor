@@ -9,7 +9,7 @@ use arrow::array::{AsArray, RecordBatch};
 use arrow::datatypes::Int64Type;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use pgrx::{PgList, PgMemoryContexts, PgRelation};
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgList, PgMemoryContexts, PgRelation};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr::null_mut;
@@ -209,33 +209,88 @@ struct Planned {
     shown: Shown,
 }
 
-/// What EXPLAIN shows of the planning: the column pages priced, and where the snail reads conditions,
-/// the rows its counts bound and PostgreSQL's own estimate of them.
+/// What EXPLAIN shows of the planning: the column pages priced, the rows the planner was told, and
+/// where the snail reads conditions, the rows its counts bound, its estimate between them and
+/// PostgreSQL's own estimate.
 #[derive(Clone, Copy)]
 struct Shown {
     priced: u64,
-    bounds: Option<(u64, u64, f64)>,
+    told: f64,
+    rows: Option<Rows>,
+}
+
+/// The rows of a scan whose conditions the snail reads, each way they are known before it runs.
+#[derive(Clone, Copy)]
+struct Rows {
+    low: u64,
+    high: u64,
+    estimate: u64,
+    statistics: f64,
 }
 
 impl Shown {
     fn text(self) -> String {
-        match self.bounds {
-            Some((low, high, estimate)) => format!("{},{low},{high},{estimate}", self.priced),
-            None => self.priced.to_string(),
+        let head = format!("{},{}", self.priced, self.told);
+        match self.rows {
+            Some(r) => format!(
+                "{head},{},{},{},{}",
+                r.low, r.high, r.estimate, r.statistics
+            ),
+            None => head,
         }
     }
 
     fn parse(text: &str) -> Shown {
         let n: Vec<&str> = text.split(',').collect();
         let int = |s: &str| s.parse::<u64>().expect("the plan keeps counts");
+        let float = |s: &str| s.parse::<f64>().expect("the plan keeps estimates");
         Shown {
             priced: int(n[0]),
-            bounds: (n.len() == 4).then(|| {
-                let estimate = n[3].parse::<f64>().expect("the plan keeps an estimate");
-                (int(n[1]), int(n[2]), estimate)
+            told: float(n[1]),
+            rows: (n.len() == 6).then(|| Rows {
+                low: int(n[2]),
+                high: int(n[3]),
+                estimate: int(n[4]),
+                statistics: float(n[5]),
             }),
         }
     }
+}
+
+/// Which rows the planner is told a scan hands out, of those known before it runs:
+/// `warren_snail.rows`, `mixed` unless set.
+#[derive(PostgresGucEnum, Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Told {
+    /// The most the snail's counts allow.
+    #[name = c"high"]
+    High,
+    /// The snail's estimate from the page maps of the blocks it reads.
+    #[name = c"counts"]
+    Counts,
+    /// PostgreSQL's own estimate of the conditions the snail reads, held between the fewest and
+    /// the most the counts allow.
+    #[name = c"statistics"]
+    Statistics,
+    /// The snail's estimate, its blocks opened by conditions it holds no key for taken at
+    /// PostgreSQL's share of them, held between the fewest and the most the counts allow.
+    #[name = c"mixed"]
+    Mixed,
+}
+
+static TOLD: GucSetting<Told> = GucSetting::<Told>::new(Told::Mixed);
+
+pub(crate) fn init() {
+    GucRegistry::define_enum_guc(
+        c"warren_snail.rows",
+        c"Which rows the planner is told a snail scan hands out.",
+        c"high: the most the snail's counts allow; counts: the snail's estimate from the page maps \
+          of the blocks it reads; statistics: PostgreSQL's estimate, between the fewest and the most \
+          the counts allow; mixed: the snail's estimate, the conditions it holds no key for at \
+          PostgreSQL's share, between the two.",
+        &TOLD,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 #[pg_guard]
@@ -247,12 +302,14 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
     let target = Target::of(relid);
     let snail = open(&target.file);
     let table = target.check(&snail);
-    let (mut conditions, mut pushed, mut local) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut conditions, mut pushed, mut on, mut local) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo).iter_ptr() {
         match deparse::condition((*ri).clause, (*rel).relid, &target.columns, table) {
-            Some(c) => {
+            Some((c, attno)) => {
                 conditions.push(c);
                 pushed.push(ri);
+                on.push(attno);
             }
             None => local.push(ri),
         }
@@ -262,7 +319,36 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
     let price = snail
         .price(&question, None)
         .unwrap_or_else(|e| refuse(format!("the snail {}: {question}: {e}", target.file)));
-    let rows = told(&price);
+    let mut handed: *mut pg_sys::List = null_mut();
+    for &ri in &pushed {
+        handed = pg_sys::lappend(handed, ri as *mut c_void);
+    }
+    let known = (!pushed.is_empty()).then(|| {
+        let share = pg_sys::clauselist_selectivity(
+            root,
+            handed,
+            0,
+            pg_sys::JoinType::JOIN_INNER,
+            null_mut(),
+        );
+        Rows {
+            low: price.rows_low,
+            high: price.rows_high,
+            estimate: price.rows_estimate,
+            statistics: pg_sys::clamp_row_est(price.table_rows as f64 * share),
+        }
+    });
+    // PostgreSQL's share of the conditions the snail holds no key for, each on a column it names.
+    let mut unkeyed: *mut pg_sys::List = null_mut();
+    for (&ri, &attno) in pushed.iter().zip(&on) {
+        let column = target.columns.iter().find(|c| c.0 == attno).map(|c| &c.1);
+        if column.is_some_and(|name| price.keyless.contains(name)) {
+            unkeyed = pg_sys::lappend(unkeyed, ri as *mut c_void);
+        }
+    }
+    let keyless =
+        pg_sys::clauselist_selectivity(root, unkeyed, 0, pg_sys::JoinType::JOIN_INNER, null_mut());
+    let rows = told(&price, known, keyless);
     let mut filtered: *mut pg_sys::List = null_mut();
     for &ri in &local {
         filtered = pg_sys::lappend(filtered, ri as *mut c_void);
@@ -271,23 +357,10 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
         pg_sys::clauselist_selectivity(root, filtered, 0, pg_sys::JoinType::JOIN_INNER, null_mut());
     (*rel).rows = pg_sys::clamp_row_est(rows * kept);
     (*rel).tuples = price.table_rows as f64;
-    let mut handed: *mut pg_sys::List = null_mut();
-    for &ri in &pushed {
-        handed = pg_sys::lappend(handed, ri as *mut c_void);
-    }
     let shown = Shown {
         priced: price.column_pages,
-        bounds: (!pushed.is_empty()).then(|| {
-            let share = pg_sys::clauselist_selectivity(
-                root,
-                handed,
-                0,
-                pg_sys::JoinType::JOIN_INNER,
-                null_mut(),
-            );
-            let estimate = pg_sys::clamp_row_est(price.table_rows as f64 * share);
-            (price.rows_low, price.rows_high, estimate)
-        }),
+        told: rows,
+        rows: known,
     };
     let pages_first = snail.pages_at_open + price.directory_pages;
     let pages = (pages_first + price.column_pages) * PAGE as u64;
@@ -306,9 +379,16 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
         PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(planned) as *mut c_void;
 }
 
-/// The rows the snail hands out, as the planner is told them: the most its counts allow.
-fn told(price: &Price) -> f64 {
-    price.rows_high as f64
+/// The rows the snail hands out, as the planner is told them, as `warren_snail.rows` says; with no
+/// condition the snail reads, the three are the same.
+fn told(price: &Price, known: Option<Rows>, keyless: f64) -> f64 {
+    let (low, high) = (price.rows_low as f64, price.rows_high as f64);
+    match (TOLD.get(), known) {
+        (Told::Counts, _) => price.rows_estimate as f64,
+        (Told::Statistics, Some(r)) => r.statistics.clamp(low, high),
+        (Told::Mixed, _) => (price.rows_estimate as f64 * keyless).clamp(low, high),
+        _ => high,
+    }
 }
 
 /// One path: every page the snail reads priced as a page read in turn, at PostgreSQL's page size.
@@ -637,10 +717,12 @@ pub(crate) unsafe extern "C-unwind" fn explain(
         es,
     );
     explain_integer("Snail Column Pages Priced", state.shown.priced, es);
-    if let Some((low, high, estimate)) = state.shown.bounds {
-        explain_text("Snail Rows", &format!("{low} to {high}"), es);
-        explain_integer("Statistics Rows", estimate.round() as u64, es);
+    if let Some(r) = state.shown.rows {
+        explain_text("Snail Rows", &format!("{} to {}", r.low, r.high), es);
+        explain_integer("Snail Rows Estimated", r.estimate, es);
+        explain_integer("Statistics Rows", r.statistics.round() as u64, es);
     }
+    explain_integer("Snail Rows Told", state.shown.told.round() as u64, es);
     if (*es).analyze {
         explain_integer("Snail Column Pages Read", sum(|r| r.column_pages_read), es);
         if let Some(snail) = &state.snail {
