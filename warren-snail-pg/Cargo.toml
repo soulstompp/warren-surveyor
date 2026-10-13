@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "warren-snail-pg"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Kenneth Allen Flegal"]
+description = "A warren-snail database file mounted in PostgreSQL as a schema of foreign tables, read only"
+repository = "https://github.com/soulstompp/warren-surveyor"
+readme = "README.md"
+keywords = ["postgresql", "pgrx", "foreign-data-wrapper", "parquet"]
+categories = ["database"]
+rust-version = "1.96"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg18"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.19.2"
+arrow = { version = "58", default-features = false }
+warren-snail = { version = "0.1.1", default-features = false }
+
+[dev-dependencies.pgrx-tests]
+version = "=0.19.2"

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+comment = 'A warren-snail database file mounted as a schema of foreign tables, read only'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'warren_snail_pg'
+relocatable = false
+superuser = true
+trusted = false
