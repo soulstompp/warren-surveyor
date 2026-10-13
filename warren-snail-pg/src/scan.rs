@@ -4,7 +4,7 @@
 //! A foreign table's scan: priced from the snail's directory as it is planned, read a block at a
 //! time as it runs, and shown by EXPLAIN as the snail's own round.
 
-use crate::{compat, datum};
+use crate::{compat, datum, deparse};
 use arrow::array::{AsArray, RecordBatch};
 use arrow::datatypes::Int64Type;
 use pgrx::pg_sys;
@@ -13,8 +13,9 @@ use pgrx::{PgList, PgMemoryContexts, PgRelation};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr::null_mut;
+use warren_snail::catalog::Table;
 use warren_snail::cut::PAGE;
-use warren_snail::read::{Round, Scan, Snail};
+use warren_snail::read::{Price, Round, Scan, Snail};
 
 pub(crate) fn refuse(message: String) -> ! {
     ereport!(ERROR, PgSqlErrorCode::ERRCODE_FDW_ERROR, message);
@@ -95,9 +96,9 @@ impl Target {
         }
     }
 
-    /// Refuses a table the snail does not hold, and a column it does not hold or the foreign table's
-    /// type cannot hold.
-    fn check(&self, snail: &Snail) {
+    /// The snail's table, refusing one the snail does not hold, and a column it does not hold or the
+    /// foreign table's type cannot hold.
+    fn check<'a>(&self, snail: &'a Snail) -> &'a Table {
         let t = snail
             .catalog
             .tables
@@ -128,18 +129,25 @@ impl Target {
                 ));
             }
         }
+        t
     }
 
-    /// The question a scan asks the snail: the columns numbered, or where it needs none, the count.
-    fn question(&self, attnos: &[i16]) -> String {
+    /// The question a scan asks the snail: the columns numbered, or where it needs none, the count,
+    /// of the rows its conditions hold.
+    fn question(&self, attnos: &[i16], conditions: &[String]) -> String {
         let table = self
             .table
             .split('.')
             .map(quoted)
             .collect::<Vec<_>>()
             .join(".");
+        let held = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
         if attnos.is_empty() {
-            return format!("SELECT count(*) FROM {table}");
+            return format!("SELECT count(*) FROM {table}{held}");
         }
         let columns = attnos
             .iter()
@@ -149,20 +157,24 @@ impl Target {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("SELECT {columns} FROM {table}")
+        format!("SELECT {columns} FROM {table}{held}")
     }
 }
 
-/// The columns a scan of `rel` returns or its conditions read, by number; every one where the row is
-/// read whole.
-unsafe fn needed(rel: *mut pg_sys::RelOptInfo, target: &Target) -> Vec<i16> {
+/// The columns a scan of `rel` returns or the conditions PostgreSQL filters read, by number; every
+/// one where the row is read whole.
+unsafe fn needed(
+    rel: *mut pg_sys::RelOptInfo,
+    target: &Target,
+    local: &[*mut pg_sys::RestrictInfo],
+) -> Vec<i16> {
     let mut attrs: *mut pg_sys::Bitmapset = null_mut();
     pg_sys::pull_varattnos(
         (*(*rel).reltarget).exprs as *mut pg_sys::Node,
         (*rel).relid,
         &mut attrs,
     );
-    for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo).iter_ptr() {
+    for &ri in local {
         pg_sys::pull_varattnos((*ri).clause as *mut pg_sys::Node, (*rel).relid, &mut attrs);
     }
     let mut out = Vec::new();
@@ -183,11 +195,13 @@ unsafe fn needed(rel: *mut pg_sys::RelOptInfo, target: &Target) -> Vec<i16> {
     out
 }
 
-/// What planning a scan found: the file and the question, the columns it fills, the rows the
-/// snail hands out and the pages it reads before its first row and after.
+/// What planning a scan found: the file and the question, the conditions the snail reads, the
+/// columns it fills, the rows the snail hands out and the pages it reads before its first row and
+/// after.
 struct Planned {
     file: String,
     question: String,
+    pushed: Vec<*mut pg_sys::RestrictInfo>,
     attnos: Vec<i16>,
     rows: f64,
     pages_first: u64,
@@ -202,21 +216,29 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
 ) {
     let target = Target::of(relid);
     let snail = open(&target.file);
-    target.check(&snail);
-    let attnos = needed(rel, &target);
-    let question = target.question(&attnos);
+    let table = target.check(&snail);
+    let (mut conditions, mut pushed, mut local) = (Vec::new(), Vec::new(), Vec::new());
+    for ri in PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo).iter_ptr() {
+        match deparse::condition((*ri).clause, (*rel).relid, &target.columns, table) {
+            Some(c) => {
+                conditions.push(c);
+                pushed.push(ri);
+            }
+            None => local.push(ri),
+        }
+    }
+    let attnos = needed(rel, &target, &local);
+    let question = target.question(&attnos, &conditions);
     let price = snail
         .price(&question, None)
         .unwrap_or_else(|e| refuse(format!("the snail {}: {question}: {e}", target.file)));
-    // Every condition is PostgreSQL's to filter: the snail hands out each of the table's rows.
-    let rows = price.rows_high as f64;
-    let kept = pg_sys::clauselist_selectivity(
-        root,
-        (*rel).baserestrictinfo,
-        0,
-        pg_sys::JoinType::JOIN_INNER,
-        null_mut(),
-    );
+    let rows = told(&price);
+    let mut filtered: *mut pg_sys::List = null_mut();
+    for &ri in &local {
+        filtered = pg_sys::lappend(filtered, ri as *mut c_void);
+    }
+    let kept =
+        pg_sys::clauselist_selectivity(root, filtered, 0, pg_sys::JoinType::JOIN_INNER, null_mut());
     (*rel).rows = pg_sys::clamp_row_est(rows * kept);
     (*rel).tuples = price.table_rows as f64;
     let pages_first = snail.pages_at_open + price.directory_pages;
@@ -225,6 +247,7 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
     let planned = Planned {
         file: target.file,
         question,
+        pushed,
         attnos,
         rows,
         pages_first,
@@ -232,6 +255,11 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
     };
     (*rel).fdw_private =
         PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(planned) as *mut c_void;
+}
+
+/// The rows the snail hands out, as the planner is told them: the most its counts allow.
+fn told(price: &Price) -> f64 {
+    price.rows_high as f64
 }
 
 /// One path: every page the snail reads priced as a page read in turn, at PostgreSQL's page size.
@@ -275,8 +303,8 @@ unsafe fn text_of(node: *mut c_void) -> String {
     .into_owned()
 }
 
-/// The plan: every condition kept for PostgreSQL to filter, and the file, the question and the
-/// columns it fills kept as text.
+/// The plan: the conditions the snail reads kept for a recheck alone, the rest for PostgreSQL to
+/// filter, and the file, the question and the columns it fills kept as text.
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn plan(
     _root: *mut pg_sys::PlannerInfo,
@@ -288,7 +316,19 @@ pub(crate) unsafe extern "C-unwind" fn plan(
     outer_plan: *mut pg_sys::Plan,
 ) -> *mut pg_sys::ForeignScan {
     let planned = &*((*rel).fdw_private as *const Planned);
-    let clauses = pg_sys::extract_actual_clauses(scan_clauses, false);
+    let (mut filtered, mut rechecked): (*mut pg_sys::List, *mut pg_sys::List) =
+        (null_mut(), null_mut());
+    for ri in PgList::<pg_sys::RestrictInfo>::from_pg(scan_clauses).iter_ptr() {
+        if (*ri).pseudoconstant {
+            continue;
+        }
+        let clause = (*ri).clause as *mut c_void;
+        if planned.pushed.contains(&ri) {
+            rechecked = pg_sys::lappend(rechecked, clause);
+        } else {
+            filtered = pg_sys::lappend(filtered, clause);
+        }
+    }
     let attnos = planned
         .attnos
         .iter()
@@ -305,12 +345,12 @@ pub(crate) unsafe extern "C-unwind" fn plan(
     }
     pg_sys::make_foreignscan(
         tlist,
-        clauses,
+        filtered,
         (*rel).relid,
         null_mut(),
         private,
         null_mut(),
-        null_mut(),
+        rechecked,
         outer_plan,
     )
 }
@@ -636,7 +676,9 @@ pub(crate) mod tests {
              (-2, -1, -1, '2000-01-01 00:00:00+00', E'tab\\there\\nline', 'x', '\\xff', -0.001), \
              (-3, 1, 1, '1970-01-01 00:00:00+00', 'Lisboa–Tejo', 'Zürich', '\\x41', 0.500), \
              (-4, 2, 2, '4714-11-24 00:00:00+00 BC', 'first', 'a', '\\x01', 0.001), \
-             (-5, 3, 3, '294247-01-10 04:00:54.775807+00', 'last', 'b', '\\x02', 0.002)",
+             (-5, 3, 3, '294247-01-10 04:00:54.775806+00', 'last', 'b', '\\x02', 0.002), \
+             (-6, 4, 4, 'infinity', 'later', 'c', '\\x03', 0.003), \
+             (-7, 5, 5, '-infinity', 'earlier', 'd', '\\x04', 0.004)",
         )
         .unwrap();
     }
@@ -657,10 +699,12 @@ pub(crate) mod tests {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         Spi::connect(|client| {
             // An instant's whole seconds and its microseconds apart: past int64, extract's epoch is
-            // rounded.
+            // rounded. The infinities are the largest and smallest bigint, as the snail holds them.
             let sql = "SELECT id, small, mid, \
-                       extract(epoch FROM date_trunc('second', at))::bigint * 1000000 \
-                       + extract(microseconds FROM at)::bigint % 1000000, name, code, raw, \
+                       CASE WHEN at = 'infinity' THEN 9223372036854775807 \
+                       WHEN at = '-infinity' THEN -9223372036854775808 \
+                       ELSE extract(epoch FROM date_trunc('second', at))::bigint * 1000000 \
+                       + extract(microseconds FROM at)::bigint % 1000000 END, name, code, raw, \
                        replace(price::text, '.', '')::bigint FROM kinds_heap";
             for row in client.select(sql, None, &[])? {
                 id.push(row.get::<i64>(1)?.unwrap());
@@ -771,7 +815,7 @@ pub(crate) mod tests {
     #[pg_test]
     fn every_value_comes_out_as_postgresql_holds_it() {
         mounted("kinds_values", 3000, named_in_data_dir);
-        assert_eq!(one("SELECT count(*)::text FROM kinds"), "3008");
+        assert_eq!(one("SELECT count(*)::text FROM kinds"), "3010");
         for (a, b) in [("kinds", "kinds_heap"), ("kinds_heap", "kinds")] {
             let sql = format!(
                 "SELECT d::text FROM (SELECT * FROM {a} EXCEPT ALL SELECT * FROM {b}) d ORDER BY 1"
@@ -805,7 +849,7 @@ pub(crate) mod tests {
             Some("SELECT count(*) FROM \"shop\".\"kinds\""),
             "{plan:#?}"
         );
-        let plan = explained("SELECT id FROM kinds WHERE small > 0");
+        let plan = explained("SELECT id FROM kinds WHERE small <> 0");
         assert_eq!(
             shown(&plan, "Snail Query"),
             Some("SELECT \"id\", \"small\" FROM \"shop\".\"kinds\""),
@@ -869,7 +913,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             (price.rows_low, price.rows_high, price.table_rows),
-            (20008, 20008, 20008)
+            (20010, 20010, 20010)
         );
         assert!(price.column_pages > 0, "{price:?}");
         let page = unsafe { pg_sys::seq_page_cost } * 4096.0 / pg_sys::BLCKSZ as f64;
@@ -878,7 +922,7 @@ pub(crate) mod tests {
             + price.column_pages as f64 * page
             + unsafe { pg_sys::cpu_tuple_cost } * price.rows_high as f64;
         let plan = texts("EXPLAIN SELECT id FROM kinds");
-        let want = format!("(cost={first:.2}..{total:.2} rows=20008 ");
+        let want = format!("(cost={first:.2}..{total:.2} rows=20010 ");
         assert!(plan[0].contains(&want), "{want}: {plan:#?}");
         // EXPLAIN alone shows the round priced, and nothing read.
         assert_eq!(shown(&plan, "Snail Order"), Some(price.order.as_str()));
@@ -910,7 +954,7 @@ pub(crate) mod tests {
     fn the_snail_is_let_go_however_the_scan_ends() {
         let path = mounted("kinds_let_go", 3000, named_whole);
         assert!(!generation_held(&path));
-        assert_eq!(one("SELECT count(*)::text FROM kinds"), "3008");
+        assert_eq!(one("SELECT count(*)::text FROM kinds"), "3010");
         assert!(!generation_held(&path));
         Spi::connect(|client| {
             let mut cursor = client.open_cursor("SELECT * FROM kinds", &[]);

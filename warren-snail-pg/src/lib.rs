@@ -10,6 +10,7 @@ use pgrx::prelude::*;
 
 mod compat;
 mod datum;
+mod deparse;
 mod import;
 mod options;
 mod scan;

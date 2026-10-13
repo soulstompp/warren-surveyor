@@ -93,8 +93,13 @@ pub(crate) unsafe fn datum(a: &ArrayRef, i: usize) -> Option<pg_sys::Datum> {
     })
 }
 
-/// An instant counted from 1970 as a timestamptz, counted from 2000.
+/// An instant counted from 1970 as a timestamptz, counted from 2000; the snail's largest and
+/// smallest instants are PostgreSQL's infinity and its negative, which timestamptz holds as its own
+/// largest and smallest.
 fn instant(from_1970: i64) -> pg_sys::Datum {
+    if from_1970 == i64::MAX || from_1970 == i64::MIN {
+        return pg_sys::Datum::from(from_1970);
+    }
     match from_1970.checked_sub(FROM_1970_TO_2000) {
         Some(t) if (FIRST_INSTANT..PAST_LAST_INSTANT).contains(&t) => pg_sys::Datum::from(t),
         _ => {
