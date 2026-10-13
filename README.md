@@ -12,6 +12,11 @@ queries.
   the same rows, has the planner plan that respelling instead. The composed file of
   [sql-composer](https://github.com/soulstompp/sql-composer) arrives as plain SQL, and the speller
   reads its statements as it reads any other.
+- [`warren-snail-pg`](warren-snail-pg/README.md) mounts a
+  [warren-snail](https://github.com/soulstompp/warren-snail) file in PostgreSQL as a schema of
+  foreign tables, read only. Each scan of one is a round of the snail's own, priced from its
+  directories while the statement is planned, and `EXPLAIN` prints it. It is a PostgreSQL 14 to 18
+  extension, on Linux.
 - [`warren-bench`](warren-bench/README.md) runs benchmark questions against a database under sets
   of its indexes, every answer checked. The kit's database is
   [sqlc-brickgen](https://github.com/soulstompp/sql-composer/tree/HEAD/examples/sqlc-brickgen)'s: a
@@ -66,7 +71,12 @@ Build and install `warren-surveyor-pg`. From the repository base directory:
 cd warren-surveyor-pg && cargo pgrx install --release --pg-config "$PG_CONFIG"
 ```
 
-This is a safe operation which does not affect existing databases or settings.
+This is a safe operation which does not affect existing databases or settings. `warren-snail-pg`
+installs the same way, again from the repository base directory:
+
+```sh
+cd warren-snail-pg && cargo pgrx install --release --pg-config "$PG_CONFIG"
+```
 
 ### Postgres.app on macOS
 
@@ -84,6 +94,7 @@ Copyright (C) 2026 Kenneth Allen Flegal
 
 ## License
 
-`warren-surveyor-pg` is licensed under the GNU General Public License, version 3 or later
-([LICENSE](LICENSE)). The speller, the bench and the kit are licensed under either of the Apache
-License, Version 2.0 or the MIT license, at your option; each holds both texts.
+`warren-surveyor-pg` and `warren-snail-pg` are licensed under the GNU General Public License,
+version 3 or later ([LICENSE](LICENSE)). The speller, the bench and the kit are licensed under
+either of the Apache License, Version 2.0 or the MIT license, at your option; each holds both
+texts.
