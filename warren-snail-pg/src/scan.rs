@@ -16,12 +16,12 @@ use std::ptr::null_mut;
 use warren_snail::cut::PAGE;
 use warren_snail::read::{Round, Scan, Snail};
 
-fn refuse(message: String) -> ! {
+pub(crate) fn refuse(message: String) -> ! {
     ereport!(ERROR, PgSqlErrorCode::ERRCODE_FDW_ERROR, message);
 }
 
 /// The value of option `name` among `options`, a list of DefElem.
-unsafe fn option(options: *mut pg_sys::List, name: &str) -> Option<String> {
+pub(crate) unsafe fn option(options: *mut pg_sys::List, name: &str) -> Option<String> {
     PgList::<pg_sys::DefElem>::from_pg(options)
         .iter_ptr()
         .find(|&d| CStr::from_ptr((*d).defname).to_bytes() == name.as_bytes())
@@ -36,8 +36,24 @@ fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn open(file: &str) -> Snail {
+pub(crate) fn open(file: &str) -> Snail {
     Snail::open(Path::new(file)).unwrap_or_else(|e| refuse(format!("the snail {file}: {e}")))
+}
+
+/// The file a server names, as it is read: a name that is not absolute lies under the data
+/// directory.
+pub(crate) unsafe fn server_file(server: *mut pg_sys::ForeignServer) -> String {
+    let named = option((*server).options, "file")
+        .unwrap_or_else(|| refuse("a warren_snail server names its file".into()));
+    if Path::new(&named).is_absolute() {
+        named
+    } else {
+        let data = CStr::from_ptr(pg_sys::DataDir).to_string_lossy();
+        Path::new(data.as_ref())
+            .join(named)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// A foreign table as the snail reads it: the file its server names, the snail's table its option
@@ -54,18 +70,7 @@ struct Target {
 impl Target {
     unsafe fn of(relid: pg_sys::Oid) -> Target {
         let ft = pg_sys::GetForeignTable(relid);
-        let server = pg_sys::GetForeignServer((*ft).serverid);
-        let named = option((*server).options, "file")
-            .unwrap_or_else(|| refuse("a warren_snail server names its file".into()));
-        let file = if Path::new(&named).is_absolute() {
-            named
-        } else {
-            let data = CStr::from_ptr(pg_sys::DataDir).to_string_lossy();
-            Path::new(data.as_ref())
-                .join(named)
-                .to_string_lossy()
-                .into_owned()
-        };
+        let file = server_file(pg_sys::GetForeignServer((*ft).serverid));
         let table = option((*ft).options, "table")
             .unwrap_or_else(|| refuse("a warren_snail foreign table names its table".into()));
         let rel = PgRelation::open(relid);
@@ -560,7 +565,7 @@ pub(crate) unsafe extern "C-unwind" fn parallel_safe(
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
-mod tests {
+pub(crate) mod tests {
     use crate::tests::refusal;
     use arrow::array::{
         ArrayRef, BinaryArray, Decimal128Array, Int16Array, Int32Array, Int64Array, RecordBatch,
@@ -574,13 +579,15 @@ mod tests {
     use warren_snail::read::Snail;
     use warren_snail::write::Rows;
 
-    const DDL: &str = "CREATE TABLE shop.kinds (id bigint NOT NULL, small smallint, mid integer, \
+    pub(crate) const DDL: &str =
+        "CREATE TABLE shop.kinds (id bigint NOT NULL, small smallint, mid integer, \
                        at timestamptz, name text, code varchar(8), raw bytea, price numeric(12,3), \
                        PRIMARY KEY (id));";
-    const COLUMNS: &str = "id bigint NOT NULL, small smallint, mid integer, at timestamptz, \
+    pub(crate) const COLUMNS: &str =
+        "id bigint NOT NULL, small smallint, mid integer, at timestamptz, \
                            name text, code varchar(8), raw bytea, price numeric(12,3)";
 
-    fn texts(sql: &str) -> Vec<String> {
+    pub(crate) fn texts(sql: &str) -> Vec<String> {
         Spi::connect(|client| {
             let mut out = Vec::new();
             for row in client.select(sql, None, &[])? {
@@ -591,13 +598,13 @@ mod tests {
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
 
-    fn one(sql: &str) -> String {
+    pub(crate) fn one(sql: &str) -> String {
         texts(sql).pop().unwrap_or_else(|| panic!("{sql}: no row"))
     }
 
     /// PostgreSQL's own copy of the rows, a heap table: `n` rows of every type, NULLs among them,
     /// then each type's edges.
-    fn heap(n: i64) {
+    pub(crate) fn heap(n: i64) {
         Spi::run("SET LOCAL TimeZone = 'UTC'").unwrap();
         Spi::run(&format!(
             "CREATE TABLE kinds_heap ({COLUMNS}, PRIMARY KEY (id))"
@@ -635,7 +642,7 @@ mod tests {
     }
 
     /// The data directory, where a server's relative file lies.
-    fn data_dir() -> PathBuf {
+    pub(crate) fn data_dir() -> PathBuf {
         PathBuf::from(
             unsafe { CStr::from_ptr(pg_sys::DataDir) }
                 .to_string_lossy()
@@ -643,10 +650,8 @@ mod tests {
         )
     }
 
-    /// The heap's rows written as a snail in the data directory, as `name`.snail.
-    fn snail(name: &str) -> PathBuf {
-        let path = data_dir().join(format!("{name}.snail"));
-        let _ = std::fs::remove_file(&path);
+    /// The heap's rows as the snail takes them.
+    pub(crate) fn kinds_batch() -> RecordBatch {
         let (mut id, mut small, mut mid, mut at) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut text, mut code, mut raw, mut price) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -670,7 +675,7 @@ mod tests {
             Ok::<_, pgrx::spi::SpiError>(())
         })
         .unwrap();
-        let batch = RecordBatch::try_from_iter([
+        RecordBatch::try_from_iter([
             ("id", Arc::new(Int64Array::from(id)) as ArrayRef),
             ("small", Arc::new(Int16Array::from(small))),
             ("mid", Arc::new(Int32Array::from(mid))),
@@ -693,11 +698,29 @@ mod tests {
                 ),
             ),
         ])
-        .unwrap();
-        let catalog = Catalog::parse(DDL).unwrap();
-        let rows = Rows::from_batches(&catalog.tables[0], &[batch]).unwrap();
-        warren_snail::write::write(&path, &catalog, &[("shop.kinds".to_string(), rows)]).unwrap();
+        .unwrap()
+    }
+
+    /// A snail of `ddl` in the data directory, as `name`.snail, each table's rows from its batch.
+    pub(crate) fn written(name: &str, ddl: &str, tables: &[(&str, RecordBatch)]) -> PathBuf {
+        let path = data_dir().join(format!("{name}.snail"));
+        let _ = std::fs::remove_file(&path);
+        let catalog = Catalog::parse(ddl).unwrap();
+        let rows: Vec<(String, Rows)> = tables
+            .iter()
+            .map(|(name, batch)| {
+                let table = catalog.tables.iter().find(|t| t.name == *name).unwrap();
+                let rows = Rows::from_batches(table, std::slice::from_ref(batch)).unwrap();
+                (name.to_string(), rows)
+            })
+            .collect();
+        warren_snail::write::write(&path, &catalog, &rows).unwrap();
         path
+    }
+
+    /// The heap's rows written as a snail in the data directory, as `name`.snail.
+    fn snail(name: &str) -> PathBuf {
+        written(name, DDL, &[("shop.kinds", kinds_batch())])
     }
 
     /// The heap, its snail, a server naming the file as `file` and the foreign table `kinds`.

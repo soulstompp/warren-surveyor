@@ -64,3 +64,19 @@ pub(crate) unsafe fn foreign_scan_path(
         )
     }
 }
+
+/// Whether `role` may use the foreign server `server`.
+pub(crate) unsafe fn server_usage(
+    server: pg_sys::Oid,
+    role: pg_sys::Oid,
+) -> pg_sys::AclResult::Type {
+    let usage = pg_sys::ACL_USAGE as pg_sys::AclMode;
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    {
+        pg_sys::pg_foreign_server_aclcheck(server, role, usage)
+    }
+    #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+    {
+        pg_sys::object_aclcheck(pg_sys::ForeignServerRelationId, server, role, usage)
+    }
+}
