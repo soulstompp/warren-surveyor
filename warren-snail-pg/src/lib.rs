@@ -8,6 +8,7 @@
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
+mod analyze;
 mod compat;
 mod datum;
 mod deparse;
@@ -54,6 +55,7 @@ pub unsafe extern "C-unwind" fn warren_snail_handler(
     routine.ExplainForeignScan = Some(scan::explain);
     routine.IsForeignScanParallelSafe = Some(scan::parallel_safe);
     routine.ImportForeignSchema = Some(import::import);
+    routine.AnalyzeForeignTable = Some(analyze::analyze);
     pg_sys::Datum::from(routine.into_pg())
 }
 

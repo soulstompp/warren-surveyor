@@ -284,7 +284,7 @@ pub(crate) unsafe fn condition(
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
-mod tests {
+pub(crate) mod tests {
     use super::civil;
     use crate::scan::tests::{one, texts, written};
     use arrow::array::{
@@ -325,7 +325,7 @@ mod tests {
 
     /// 20,000 events over three years, in a heap of PostgreSQL's and in a snail, the snail's table
     /// imported into `mounted` and its clock made in `shop`.
-    fn events() -> std::path::PathBuf {
+    pub(crate) fn events() -> std::path::PathBuf {
         Spi::run("SET LOCAL TimeZone = 'UTC'").unwrap();
         Spi::run(
             "CREATE TABLE events_heap (id bigint NOT NULL PRIMARY KEY, at timestamptz NOT NULL, \

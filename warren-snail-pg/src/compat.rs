@@ -80,3 +80,15 @@ pub(crate) unsafe fn server_usage(
         pg_sys::object_aclcheck(pg_sys::ForeignServerRelationId, server, role, usage)
     }
 }
+
+/// A fraction drawn from the sampler's random state, in [0, 1).
+pub(crate) unsafe fn random_fract(state: &mut pg_sys::ReservoirStateData) -> f64 {
+    #[cfg(feature = "pg14")]
+    {
+        pg_sys::sampler_random_fract(state.randstate.as_mut_ptr())
+    }
+    #[cfg(not(feature = "pg14"))]
+    {
+        pg_sys::sampler_random_fract(&mut state.randstate)
+    }
+}

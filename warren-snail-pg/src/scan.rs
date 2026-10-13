@@ -59,17 +59,17 @@ pub(crate) unsafe fn server_file(server: *mut pg_sys::ForeignServer) -> String {
 
 /// A foreign table as the snail reads it: the file its server names, the snail's table its option
 /// names, and its own columns.
-struct Target {
+pub(crate) struct Target {
     /// The file as it is read: a name that is not absolute lies under the data directory.
-    file: String,
-    table: String,
-    name: String,
+    pub(crate) file: String,
+    pub(crate) table: String,
+    pub(crate) name: String,
     /// Each column not dropped: its number, name, type and type modifier.
-    columns: Vec<(i16, String, pg_sys::Oid, i32)>,
+    pub(crate) columns: Vec<(i16, String, pg_sys::Oid, i32)>,
 }
 
 impl Target {
-    unsafe fn of(relid: pg_sys::Oid) -> Target {
+    pub(crate) unsafe fn of(relid: pg_sys::Oid) -> Target {
         let ft = pg_sys::GetForeignTable(relid);
         let file = server_file(pg_sys::GetForeignServer((*ft).serverid));
         let table = option((*ft).options, "table")
@@ -98,7 +98,7 @@ impl Target {
 
     /// The snail's table, refusing one the snail does not hold, and a column it does not hold or the
     /// foreign table's type cannot hold.
-    fn check<'a>(&self, snail: &'a Snail) -> &'a Table {
+    pub(crate) fn check<'a>(&self, snail: &'a Snail) -> &'a Table {
         let t = snail
             .catalog
             .tables
@@ -134,7 +134,7 @@ impl Target {
 
     /// The question a scan asks the snail: the columns numbered, or where it needs none, the count,
     /// of the rows its conditions hold.
-    fn question(&self, attnos: &[i16], conditions: &[String]) -> String {
+    pub(crate) fn question(&self, attnos: &[i16], conditions: &[String]) -> String {
         let table = self
             .table
             .split('.')
@@ -206,6 +206,36 @@ struct Planned {
     rows: f64,
     pages_first: u64,
     pages_after: u64,
+    shown: Shown,
+}
+
+/// What EXPLAIN shows of the planning: the column pages priced, and where the snail reads conditions,
+/// the rows its counts bound and PostgreSQL's own estimate of them.
+#[derive(Clone, Copy)]
+struct Shown {
+    priced: u64,
+    bounds: Option<(u64, u64, f64)>,
+}
+
+impl Shown {
+    fn text(self) -> String {
+        match self.bounds {
+            Some((low, high, estimate)) => format!("{},{low},{high},{estimate}", self.priced),
+            None => self.priced.to_string(),
+        }
+    }
+
+    fn parse(text: &str) -> Shown {
+        let n: Vec<&str> = text.split(',').collect();
+        let int = |s: &str| s.parse::<u64>().expect("the plan keeps counts");
+        Shown {
+            priced: int(n[0]),
+            bounds: (n.len() == 4).then(|| {
+                let estimate = n[3].parse::<f64>().expect("the plan keeps an estimate");
+                (int(n[1]), int(n[2]), estimate)
+            }),
+        }
+    }
 }
 
 #[pg_guard]
@@ -241,6 +271,24 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
         pg_sys::clauselist_selectivity(root, filtered, 0, pg_sys::JoinType::JOIN_INNER, null_mut());
     (*rel).rows = pg_sys::clamp_row_est(rows * kept);
     (*rel).tuples = price.table_rows as f64;
+    let mut handed: *mut pg_sys::List = null_mut();
+    for &ri in &pushed {
+        handed = pg_sys::lappend(handed, ri as *mut c_void);
+    }
+    let shown = Shown {
+        priced: price.column_pages,
+        bounds: (!pushed.is_empty()).then(|| {
+            let share = pg_sys::clauselist_selectivity(
+                root,
+                handed,
+                0,
+                pg_sys::JoinType::JOIN_INNER,
+                null_mut(),
+            );
+            let estimate = pg_sys::clamp_row_est(price.table_rows as f64 * share);
+            (price.rows_low, price.rows_high, estimate)
+        }),
+    };
     let pages_first = snail.pages_at_open + price.directory_pages;
     let pages = (pages_first + price.column_pages) * PAGE as u64;
     (*rel).pages = pages.div_ceil(pg_sys::BLCKSZ as u64) as pg_sys::BlockNumber;
@@ -252,6 +300,7 @@ pub(crate) unsafe extern "C-unwind" fn rel_size(
         rows,
         pages_first,
         pages_after: price.column_pages,
+        shown,
     };
     (*rel).fdw_private =
         PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(planned) as *mut c_void;
@@ -336,10 +385,12 @@ pub(crate) unsafe extern "C-unwind" fn plan(
         .collect::<Vec<_>>()
         .join(",");
     let mut private: *mut pg_sys::List = null_mut();
+    let shown = planned.shown.text();
     for s in [
         planned.file.as_str(),
         planned.question.as_str(),
         attnos.as_str(),
+        shown.as_str(),
     ] {
         private = pg_sys::lappend(private, text_const(s));
     }
@@ -369,6 +420,7 @@ struct Scanning {
     /// Where the snail counts: the rows still to hand out, once it has.
     counted: Option<u64>,
     ended: Vec<Round>,
+    shown: Shown,
     /// Whether it holds one of the files PostgreSQL lets a backend open beside its own.
     file_held: bool,
 }
@@ -426,10 +478,12 @@ pub(crate) unsafe extern "C-unwind" fn begin(node: *mut pg_sys::ForeignScanState
         .filter(|s| !s.is_empty())
         .map(|s| s.parse::<i16>().expect("the plan keeps column numbers"))
         .collect();
+    let shown = Shown::parse(&text_of(pg_sys::list_nth(private, 3)));
     let scanning = Scanning {
         file,
         question,
         attnos,
+        shown,
         snail: None,
         scan: None,
         batch: None,
@@ -582,6 +636,11 @@ pub(crate) unsafe extern "C-unwind" fn explain(
         sum(|r| r.column_pages_predicted),
         es,
     );
+    explain_integer("Snail Column Pages Priced", state.shown.priced, es);
+    if let Some((low, high, estimate)) = state.shown.bounds {
+        explain_text("Snail Rows", &format!("{low} to {high}"), es);
+        explain_integer("Statistics Rows", estimate.round() as u64, es);
+    }
     if (*es).analyze {
         explain_integer("Snail Column Pages Read", sum(|r| r.column_pages_read), es);
         if let Some(snail) = &state.snail {
@@ -768,7 +827,7 @@ pub(crate) mod tests {
     }
 
     /// The heap, its snail, a server naming the file as `file` and the foreign table `kinds`.
-    fn mounted(name: &str, n: i64, file: impl Fn(&Path) -> String) -> PathBuf {
+    pub(crate) fn mounted(name: &str, n: i64, file: impl Fn(&Path) -> String) -> PathBuf {
         heap(n);
         let path = snail(name);
         Spi::run(&format!(
@@ -788,7 +847,7 @@ pub(crate) mod tests {
         path.file_name().unwrap().to_string_lossy().into_owned()
     }
 
-    fn named_whole(path: &Path) -> String {
+    pub(crate) fn named_whole(path: &Path) -> String {
         path.to_string_lossy().into_owned()
     }
 
@@ -806,7 +865,7 @@ pub(crate) mod tests {
     }
 
     /// Whether a round anywhere holds the generation the snail's file is at, or an older one.
-    fn generation_held(path: &Path) -> bool {
+    pub(crate) fn generation_held(path: &Path) -> bool {
         let generation = Snail::open(path).unwrap().generation();
         let file = std::fs::File::open(path).unwrap();
         warren_snail::lock::older_held(&file, generation + 1).unwrap()
@@ -891,6 +950,10 @@ pub(crate) mod tests {
         );
         assert!(pages("Snail Column Pages Read") > 0, "{plan:#?}");
         assert_eq!(pages("Snail Pages Held"), 0);
+        assert_eq!(
+            pages("Snail Column Pages Priced"),
+            round.column_pages_predicted
+        );
         // Rows asked for a block at a time: a scan stopped at its first row has read its first
         // block alone.
         let plan = explained("SELECT id, name FROM kinds LIMIT 1");
