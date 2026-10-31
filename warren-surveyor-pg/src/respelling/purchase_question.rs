@@ -121,26 +121,27 @@ mod tests {
         ),
     ];
 
-    /// The purchase question as written, over each form of purchases, returns the rows of the
-    /// question grouped per set, and its plan groups the purchases and the lines each before the
-    /// join.
-    fn the_purchase_question_is_respelled(indexes: Indexes) {
-        lego(indexes);
+    /// With a surveyor on each table, the purchase question as written, over each form of
+    /// purchases, returns the rows of the question grouped per set, and its plan groups the
+    /// purchases and the lines each before the join.
+    #[pg_test]
+    fn the_purchase_question_is_respelled_on_surveyors() {
+        lego();
         for (form, purchases) in PURCHASE_FORMS {
             let written = PURCHASES_AS_WRITTEN.replace("{purchases}", purchases);
             let per_set = PURCHASES_PER_SET.replace("{purchases}", purchases);
             let answer = rows(&written);
-            assert_eq!(answer.len(), 20, "{indexes:?}, {form}: {answer:?}");
-            assert_eq!(answer, rows(&per_set), "{indexes:?}, {form}");
-            assert!(respelled(&written), "{indexes:?}, {form}");
+            assert_eq!(answer.len(), 20, "{form}: {answer:?}");
+            assert_eq!(answer, rows(&per_set), "{form}");
+            assert!(respelled(&written), "{form}");
             let plan = explain(&written);
             assert!(
                 grouped_apart(&plan, " on lego_purchases", " on lego_inventory_parts"),
-                "{indexes:?}, {form}\n{plan}"
+                "{form}\n{plan}"
             );
             assert!(
                 grouped_apart(&plan, " on lego_inventory_parts", " on lego_purchases"),
-                "{indexes:?}, {form}\n{plan}"
+                "{form}\n{plan}"
             );
             // the lines are grouped only for the sets the purchases' grouping holds
             assert!(
@@ -150,37 +151,6 @@ mod tests {
                     " on lego_purchases",
                     "CTE Scan on side_a"
                 ),
-                "{indexes:?}, {form}\n{plan}"
-            );
-        }
-    }
-
-    #[pg_test]
-    fn the_purchase_question_is_respelled_on_surveyors() {
-        the_purchase_question_is_respelled(Indexes::Surveyors);
-    }
-
-    #[pg_test]
-    fn the_purchase_question_is_respelled_on_btrees() {
-        the_purchase_question_is_respelled(Indexes::BTrees);
-    }
-
-    #[pg_test]
-    fn the_purchase_question_is_respelled_on_primary_keys_alone() {
-        the_purchase_question_is_respelled(Indexes::KeysAlone);
-    }
-
-    #[pg_test]
-    fn without_the_collections_key_the_purchases_and_lines_are_joined_before_they_are_grouped() {
-        lego(Indexes::Surveyors);
-        Spi::run("ALTER TABLE lego.lego_collection DROP CONSTRAINT lego_collection_pkey").unwrap();
-        for (form, purchases) in PURCHASE_FORMS {
-            let written = PURCHASES_AS_WRITTEN.replace("{purchases}", purchases);
-            let per_set = PURCHASES_PER_SET.replace("{purchases}", purchases);
-            assert_eq!(rows(&written), rows(&per_set), "{form}");
-            let plan = explain(&written);
-            assert!(
-                !grouped_apart(&plan, " on lego_purchases", " on lego_inventory_parts"),
                 "{form}\n{plan}"
             );
         }

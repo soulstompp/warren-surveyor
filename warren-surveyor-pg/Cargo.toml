@@ -17,18 +17,18 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["pg18"]
-pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "warren-pg-speller/pg14"]
-pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "warren-pg-speller/pg15"]
-pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "warren-pg-speller/pg16"]
-pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "warren-pg-speller/pg17"]
-pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "warren-pg-speller/pg18"]
-pg19 = ["pgrx/pg19", "pgrx-tests/pg19", "warren-pg-speller/pg19"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "warren-speller-pg/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "warren-speller-pg/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "warren-speller-pg/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "warren-speller-pg/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "warren-speller-pg/pg18"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19", "warren-speller-pg/pg19"]
 pg_test = []
 pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 pgrx = "=0.19.2"
-warren-pg-speller = { path = "../warren-pg-speller", version = "0.1.2", default-features = false }
+warren-speller-pg = { git = "https://github.com/soulstompp/warren-speller", rev = "bec1a46efab179bb7a0d165ec7b0f01e8377b535", version = "0.1.0", default-features = false }
 
 [dependencies.pgrx-bench]
 version = "=0.19.2"

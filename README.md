@@ -7,9 +7,10 @@ queries.
   without digging: while a statement is planned, it reads your indexes to reduce guesswork and
   costly scans. It is implemented as a PostgreSQL 14 to 18 extension.
 
-- [`warren-pg-speller`](warren-pg-speller/README.md) is the speller. It examines queries while
-  PostgreSQL plans them and, where the query and the catalog show that another spelling returns
-  the same rows, has the planner plan that respelling instead. The composed file of
+- [`warren-speller-pg`](https://github.com/soulstompp/warren-speller), in the warren-speller
+  repository, is the speller `warren-surveyor-pg` installs. It examines queries while PostgreSQL
+  plans them and, where the query and the catalog show that another spelling returns the same rows,
+  has the planner plan that respelling instead. The composed file of
   [sql-composer](https://github.com/soulstompp/sql-composer) arrives as plain SQL, and the speller
   reads its statements as it reads any other.
 - [`warren-bench`](warren-bench/README.md) runs benchmark questions against a database under sets
@@ -85,5 +86,6 @@ Copyright (C) 2026 Kenneth Allen Flegal
 ## License
 
 `warren-surveyor-pg` is licensed under the GNU General Public License, version 3 or later
-([LICENSE](LICENSE)). The speller, the bench and the kit are licensed under either of the Apache
-License, Version 2.0 or the MIT license, at your option; each holds both texts.
+([LICENSE](LICENSE)). The bench, the kit and the `warren-pg-speller` page, which points to the
+speller in [warren-speller](https://github.com/soulstompp/warren-speller), are licensed under either
+of the Apache License, Version 2.0 or the MIT license, at your option; each holds both texts.

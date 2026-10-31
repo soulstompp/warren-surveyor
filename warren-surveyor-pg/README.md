@@ -402,7 +402,7 @@ it.
 
 **What it reads.** While PostgreSQL plans, in a session that has loaded the library: every
 `SELECT`, with a surveyor on its tables or none, as PostgreSQL parsed it, and the catalog where a
-rule needs it, as [warren-pg-speller's README][speller-catalog] sets out. Wherever the statement
+rule needs it, as [warren-speller-pg's README][speller-catalog] sets out. Wherever the statement
 and the catalog show it returns the same rows, the statement is planned through another spelling of
 it:
 
@@ -426,7 +426,7 @@ read by the join of the two sides and under side B's grouping, which keeps only 
 holds: in each arm, where side B is a `UNION ALL`.
 
 **Where it stops.** Where any condition a rule checks fails, the statement is planned as written;
-every condition is in [warren-pg-speller's README][speller]. Nothing is respelled inside a parallel
+every condition is in [warren-speller-pg's README][speller]. Nothing is respelled inside a parallel
 operation. A respelling that raises an error once it has begun to build a spelling, a cancel apart,
 is rolled back, and the statement is planned as written, with the budget and the surveyor's
 measures as they stood before the respelling began; the two plannings together may then read up to
@@ -467,7 +467,7 @@ To see what was measured, and from what, set `client_min_messages = debug1` (or
   or `the WITH query <name>`, with `read stopped at the planning-read limit` or `not started at the
   planning-read limit`, `half the planning-read limit` for a statistics read;
 - where a respelling failed and the statement was planned as written,
-  `warren-pg-speller: planned as written, the respelling failed: <message>`.
+  `warren-speller-pg: planned as written, the respelling failed: <message>`.
 
 The kit does this for 25 questions on PostgreSQL alone, on the respelling alone and with the
 surveyor, the DBA's indexes the same on each, every answer checked by its row count and a digest of
@@ -523,9 +523,10 @@ PostgreSQL 14 to 18 (14.19, 15.14, 16.10, 17.6 or later), Rust 1.96 or later and
 On 14 and 15, building a surveyor warns that an UPDATE changing one of its columns is no longer HOT.
 On a server installed by a package manager, also its development package and libclang, which pgrx
 builds against; there `cargo pgrx install` takes `--sudo`, since the server's directories are the
-system's. It builds against `warren-pg-speller`, beside it in this repository. pgrx reads where your
-PostgreSQL is from `~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`); the last line below writes
-that file, and where it exists already, add that `pg` line under its `[configs]` instead:
+system's. It builds against `warren-speller-pg`, from
+[warren-speller](https://github.com/soulstompp/warren-speller). pgrx reads where your PostgreSQL is
+from `~/.pgrx/config.toml` (or `$PGRX_HOME/config.toml`); the last line below writes that file,
+and where it exists already, add that `pg` line under its `[configs]` instead:
 
 ```sh
 PG_CONFIG=/path/to/pg_config
@@ -708,7 +709,7 @@ General Public License as published by the Free Software Foundation, either vers
 License, or (at your option) any later version. See [LICENSE][LICENSE].
 
 [kit]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/kit/README.md
-[speller]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md
-[speller-catalog]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-pg-speller/README.md#what-it-reads-from-the-catalog
+[speller]: https://github.com/soulstompp/warren-speller/blob/HEAD/warren-speller-pg/README.md
+[speller-catalog]: https://github.com/soulstompp/warren-speller/blob/HEAD/warren-speller-pg/README.md#what-it-reads-from-the-catalog
 [respell]: https://github.com/soulstompp/sql-composer/blob/HEAD/README.md#a-union-of-arms-that-read-one-roster---respell
 [LICENSE]: https://github.com/soulstompp/warren-surveyor/blob/HEAD/warren-surveyor-pg/LICENSE
