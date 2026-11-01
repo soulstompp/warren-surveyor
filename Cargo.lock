@@ -2891,8 +2891,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "warren-pg-speller"
-version = "0.1.2"
+name = "warren-speller-pg"
+version = "0.1.0"
+source = "git+https://github.com/soulstompp/warren-speller?rev=bec1a46efab179bb7a0d165ec7b0f01e8377b535#bec1a46efab179bb7a0d165ec7b0f01e8377b535"
 dependencies = [
  "pgrx",
 ]
@@ -2905,7 +2906,7 @@ dependencies = [
  "pgrx-bench",
  "pgrx-tests",
  "postgres",
- "warren-pg-speller",
+ "warren-speller-pg",
 ]
 
 [[package]]

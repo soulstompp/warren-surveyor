@@ -218,3 +218,158 @@ unsafe extern "C-unwind" fn subtransaction(
         _ => {}
     }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use crate::respelling::catalogue::*;
+    use pgrx::prelude::*;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::CStr;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+    static mut NEXT_PATHLIST: pg_sys::set_rel_pathlist_hook_type = None;
+    static mut NEXT_EMIT: pg_sys::emit_log_hook_type = None;
+
+    /// The speller's note of the respelling the test makes fail.
+    const FAILED: &str =
+        "warren-speller-pg: planned as written, the respelling failed: a seeded failure";
+
+    thread_local! {
+        /// The pages of the budget left when a scan of a WITH query named `side_a` raised its
+        /// seeded error, once one has.
+        static LEFT_AT_FAILURE: Cell<Option<u32>> = const { Cell::new(None) };
+        /// The surveyor's and the speller's notes, while a test keeps them.
+        static NOTES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    #[pg_guard]
+    unsafe extern "C-unwind" fn failing_at_side_a(
+        root: *mut pg_sys::PlannerInfo,
+        rel: *mut pg_sys::RelOptInfo,
+        rti: pg_sys::Index,
+        rte: *mut pg_sys::RangeTblEntry,
+    ) {
+        if let Some(next) = NEXT_PATHLIST {
+            next(root, rel, rti, rte);
+        }
+        if (*rte).rtekind == pg_sys::RTEKind::RTE_CTE
+            && CStr::from_ptr((*rte).ctename).to_bytes() == b"side_a"
+        {
+            LEFT_AT_FAILURE.set(Some(crate::budget::left()));
+            ereport!(
+                PgLogLevel::ERROR,
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                "a seeded failure"
+            );
+        }
+    }
+
+    /// Keeps each of the surveyor's and the speller's notes as it goes to the server's log.
+    #[pg_guard]
+    unsafe extern "C-unwind" fn keep_note(edata: *mut pg_sys::ErrorData) {
+        if let Some(next) = NEXT_EMIT {
+            next(edata);
+        }
+        if edata.is_null() || (*edata).message.is_null() {
+            return;
+        }
+        let text = CStr::from_ptr((*edata).message).to_string_lossy();
+        if text.starts_with("surveyor:") || text.starts_with("warren-speller-pg:") {
+            NOTES.with(|n| {
+                if let Some(n) = n.borrow_mut().as_mut() {
+                    n.push(text.into_owned());
+                }
+            });
+        }
+    }
+
+    /// Runs `f` while a scan of a WITH query named `side_a` raises an ERROR as it is planned.
+    fn failing_at_side_a_while<T>(f: impl FnOnce() -> T) -> T {
+        LEFT_AT_FAILURE.set(None);
+        unsafe {
+            NEXT_PATHLIST = pg_sys::set_rel_pathlist_hook;
+            pg_sys::set_rel_pathlist_hook = Some(failing_at_side_a);
+        }
+        let result = catch_unwind(AssertUnwindSafe(f));
+        unsafe { pg_sys::set_rel_pathlist_hook = NEXT_PATHLIST };
+        result.unwrap_or_else(|e| resume_unwind(e))
+    }
+
+    /// Runs `f` with every statement planned through the surveyor's round alone, no respelling
+    /// tried.
+    fn never_respelled<T>(f: impl FnOnce() -> T) -> T {
+        let speller = unsafe { super::NEXT_PLANNER };
+        unsafe { super::NEXT_PLANNER = None };
+        let result = catch_unwind(AssertUnwindSafe(f));
+        unsafe { super::NEXT_PLANNER = speller };
+        result.unwrap_or_else(|e| resume_unwind(e))
+    }
+
+    /// What planning `sql` gives: its plan, each line with the rows and width it is estimated at
+    /// and without its costs; the surveyor's and the speller's notes at DEBUG1; and the pages the
+    /// surveyor drew, with its budget.
+    fn planned(sql: &str) -> (Vec<String>, Vec<String>, (u64, Option<u64>)) {
+        crate::budget::tests::LAST.set(None);
+        NOTES.with(|n| *n.borrow_mut() = Some(Vec::new()));
+        unsafe {
+            NEXT_EMIT = pg_sys::emit_log_hook;
+            pg_sys::emit_log_hook = Some(keep_note);
+        }
+        let lines = catch_unwind(|| {
+            Spi::run("SET LOCAL log_min_messages = debug1").unwrap();
+            crate::tests::texts(&format!("EXPLAIN {sql}"))
+        });
+        unsafe { pg_sys::emit_log_hook = NEXT_EMIT };
+        Spi::run("RESET log_min_messages").unwrap();
+        let notes = NOTES.with(|n| n.borrow_mut().take().unwrap_or_default());
+        let plan = lines
+            .unwrap_or_else(|e| resume_unwind(e))
+            .into_iter()
+            .map(|line| match (line.find("(cost="), line.find(" rows=")) {
+                (Some(from), Some(to)) => format!("{}({}", &line[..from], &line[to + 1..]),
+                _ => line,
+            })
+            .collect();
+        let drawn = crate::budget::tests::LAST
+            .get()
+            .expect("a statement planned");
+        (plan, notes, drawn)
+    }
+
+    /// A respelling that measures and then fails leaves the statement planned as written as a
+    /// planning that never tried it plans it: the same sizes, measured by the same reads, and the
+    /// same pages drawn of the same budget.
+    #[pg_test]
+    fn a_statement_whose_respelling_fails_is_planned_with_the_sizes_and_budget_of_one_never_respelled(
+    ) {
+        lego();
+        // the purchases of each December, which the surveyor on the purchases measures
+        let query = BY_ZONE_AND_CATEGORY.replace(
+            "GROUP BY 1, 2",
+            "WHERE extract(month FROM lego.clock(p.ordered_at))::smallint = 12 GROUP BY 1, 2",
+        );
+        let (never_plan, never_notes, never_drawn) = never_respelled(|| planned(&query));
+        let (plan, notes, drawn) = failing_at_side_a_while(|| planned(&query));
+        let left = LEFT_AT_FAILURE.get().expect("the respelling did not fail");
+        let limit = never_drawn.1.expect("no budget counted");
+        // the surveyor measured inside the respelling, and drew on the budget, before it failed
+        assert!(
+            u64::from(left) < limit,
+            "{left} pages left of {limit} when the respelling failed"
+        );
+        let failed = notes.iter().position(|n| n == FAILED);
+        let failed = failed.unwrap_or_else(|| panic!("{notes:#?}"));
+        let measured = |n: &[String]| {
+            n.iter()
+                .filter(|n| n.starts_with("surveyor: lego_purchases measured at "))
+                .count()
+        };
+        assert_eq!(measured(&notes[..failed]), 1, "{notes:#?}");
+        assert_eq!(measured(&never_notes), 1, "{never_notes:#?}");
+        assert!(!plan.join("\n").contains("side_a"), "{plan:#?}");
+        assert_eq!(plan, never_plan);
+        assert_eq!(notes[failed + 1..], never_notes[..]);
+        assert_eq!(drawn, never_drawn);
+    }
+}

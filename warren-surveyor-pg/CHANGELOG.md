@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- The respelling of `warren-speller-pg` 0.1.0, installed with the library: the code of
+  `warren-pg-speller` 0.1.2 under its new name, from
+  [warren-speller](https://github.com/soulstompp/warren-speller). Where a respelling fails, the note
+  at `DEBUG1` reads `warren-speller-pg: planned as written, the respelling failed: <message>`.
+
 ## 0.1.1
 
 - PostgreSQL 14, 15, 16 and 17 as well as 18, each a Cargo feature, `pg14` to `pg18`; `pg18` is the

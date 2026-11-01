@@ -7,32 +7,22 @@
 use crate::tests::texts;
 use pgrx::prelude::*;
 
-/// Which indexes the catalogue's tables carry besides their primary keys.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Indexes {
-    /// None.
-    KeysAlone,
-    /// A B-tree on each key the questions join and filter on.
-    BTrees,
-    /// Those B-trees, and a surveyor on each table they are on.
-    Surveyors,
-}
-
 /// A catalogue of sets in the schema `lego`, each fact in the table its key decides, and `lego`
 /// first on the search path: a tree of 40 themes under 8 roots; 240 sets; each set's version 1
 /// inventory and every fifth set's version 2; sets nested in every seventh set's version 1
 /// inventory; ten lines to an inventory, of 150 parts in 12 categories and 20 colours; 60
 /// builders in 7 zones; 8 collection rows to a builder, each holding one set; and one to three
-/// purchases of each collection row, from 2008 to 2020. `indexes` says which other indexes the
-/// tables carry; every index's pages are read into shared buffers.
-pub(crate) fn lego(indexes: Indexes) {
-    lego_of(indexes, 240);
+/// purchases of each collection row, from 2008 to 2020. Besides their primary keys, the tables
+/// carry a B-tree on each key the questions join and filter on, and a surveyor on each table those
+/// B-trees are on; every index's pages are read into shared buffers.
+pub(crate) fn lego() {
+    lego_of(240);
 }
 
 /// The catalogue `lego` makes, with `sets` sets in place of 240, their inventories and nested sets
 /// numbered as there; the version 2 inventories are numbered from the first thousand above every
 /// version 1 inventory.
-pub(crate) fn lego_of(indexes: Indexes, sets: u32) {
+fn lego_of(sets: u32) {
     let second = (sets / 1000 + 1) * 1000;
     Spi::run(&format!(
         "CREATE SCHEMA lego; \
@@ -92,40 +82,36 @@ pub(crate) fn lego_of(indexes: Indexes, sets: u32) {
          FROM lego.lego_collection c, generate_series(1, 3) g WHERE g <= 1 + (c.builder_id + c.row_no) % 3"
     ))
     .expect("the catalogue could not be made");
-    if let Indexes::BTrees | Indexes::Surveyors = indexes {
-        Spi::run(
-            "CREATE INDEX ON lego.lego_themes (parent_id, id); \
-             CREATE INDEX ON lego.lego_sets (theme_id, set_num); \
-             CREATE INDEX ON lego.lego_sets (theme_id, year) INCLUDE (set_num); \
-             CREATE INDEX ON lego.lego_inventories (set_num, version, id); \
-             CREATE INDEX ON lego.lego_inventory_sets (inventory_id, set_num); \
-             CREATE INDEX ON lego.lego_inventory_parts (inventory_id, part_num, color_id); \
-             CREATE INDEX ON lego.lego_parts (part_cat_id, part_num) INCLUDE (name); \
-             CREATE INDEX ON lego.lego_collection (set_num, builder_id, row_no); \
-             CREATE INDEX ON lego.lego_collection (builder_id, row_no) INCLUDE (set_num); \
-             CREATE INDEX ON lego.lego_purchases \
-                 (builder_id, row_no, (extract(month FROM lego.clock(ordered_at))::smallint), lego.clock(ordered_at)) \
-                 INCLUDE (ordered_at, purchase_id); \
-             CREATE INDEX ON lego.lego_purchases \
-                 ((extract(month FROM lego.clock(ordered_at))::smallint), lego.clock(ordered_at)) \
-                 INCLUDE (builder_id, row_no, ordered_at, purchase_id)",
-        )
-        .expect("the indexes could not be made");
-    }
-    if let Indexes::Surveyors = indexes {
-        Spi::run(
-            "CREATE INDEX ON lego.lego_themes USING surveyor (parent_id, id); \
-             CREATE INDEX ON lego.lego_sets USING surveyor (theme_id, set_num); \
-             CREATE INDEX ON lego.lego_inventories USING surveyor (set_num, version, id); \
-             CREATE INDEX ON lego.lego_inventory_sets USING surveyor (inventory_id, set_num); \
-             CREATE INDEX ON lego.lego_inventory_parts USING surveyor (inventory_id, part_num, color_id); \
-             CREATE INDEX ON lego.lego_parts USING surveyor (part_cat_id, part_num); \
-             CREATE INDEX ON lego.lego_collection USING surveyor (set_num, builder_id, row_no); \
-             CREATE INDEX ON lego.lego_purchases USING surveyor \
-                 (builder_id, row_no, (extract(month FROM lego.clock(ordered_at))::smallint), lego.clock(ordered_at))",
-        )
-        .expect("the surveyors could not be made");
-    }
+    Spi::run(
+        "CREATE INDEX ON lego.lego_themes (parent_id, id); \
+         CREATE INDEX ON lego.lego_sets (theme_id, set_num); \
+         CREATE INDEX ON lego.lego_sets (theme_id, year) INCLUDE (set_num); \
+         CREATE INDEX ON lego.lego_inventories (set_num, version, id); \
+         CREATE INDEX ON lego.lego_inventory_sets (inventory_id, set_num); \
+         CREATE INDEX ON lego.lego_inventory_parts (inventory_id, part_num, color_id); \
+         CREATE INDEX ON lego.lego_parts (part_cat_id, part_num) INCLUDE (name); \
+         CREATE INDEX ON lego.lego_collection (set_num, builder_id, row_no); \
+         CREATE INDEX ON lego.lego_collection (builder_id, row_no) INCLUDE (set_num); \
+         CREATE INDEX ON lego.lego_purchases \
+             (builder_id, row_no, (extract(month FROM lego.clock(ordered_at))::smallint), lego.clock(ordered_at)) \
+             INCLUDE (ordered_at, purchase_id); \
+         CREATE INDEX ON lego.lego_purchases \
+             ((extract(month FROM lego.clock(ordered_at))::smallint), lego.clock(ordered_at)) \
+             INCLUDE (builder_id, row_no, ordered_at, purchase_id)",
+    )
+    .expect("the indexes could not be made");
+    Spi::run(
+        "CREATE INDEX ON lego.lego_themes USING surveyor (parent_id, id); \
+         CREATE INDEX ON lego.lego_sets USING surveyor (theme_id, set_num); \
+         CREATE INDEX ON lego.lego_inventories USING surveyor (set_num, version, id); \
+         CREATE INDEX ON lego.lego_inventory_sets USING surveyor (inventory_id, set_num); \
+         CREATE INDEX ON lego.lego_inventory_parts USING surveyor (inventory_id, part_num, color_id); \
+         CREATE INDEX ON lego.lego_parts USING surveyor (part_cat_id, part_num); \
+         CREATE INDEX ON lego.lego_collection USING surveyor (set_num, builder_id, row_no); \
+         CREATE INDEX ON lego.lego_purchases USING surveyor \
+             (builder_id, row_no, (extract(month FROM lego.clock(ordered_at))::smallint), lego.clock(ordered_at))",
+    )
+    .expect("the surveyors could not be made");
     Spi::run(
         "ANALYZE lego.lego_themes; ANALYZE lego.lego_sets; ANALYZE lego.lego_inventories; \
          ANALYZE lego.lego_inventory_sets; ANALYZE lego.lego_part_categories; ANALYZE lego.lego_parts; \
@@ -252,27 +238,3 @@ pub(crate) const BY_ZONE_AND_CATEGORY: &str = "SELECT b.home_zone, pc.name AS ca
     JOIN lego_parts pt ON pt.part_num = ip.part_num \
     JOIN lego_part_categories pc ON pc.id = pt.part_cat_id \
     GROUP BY 1, 2 ORDER BY bricks DESC, 1, 2";
-
-/// The same, with the purchases and the lines each grouped per set before the join.
-pub(crate) const BY_ZONE_AND_CATEGORY_PER_SET: &str = "WITH z AS ( \
-        SELECT c.set_num, b.home_zone, count(*) AS purchases \
-        FROM lego_purchases p \
-        JOIN lego_collection c ON c.builder_id = p.builder_id AND c.row_no = p.row_no \
-        JOIN lego_builders b ON b.builder_id = p.builder_id \
-        GROUP BY 1, 2), \
-    k AS ( \
-        SELECT i.set_num, pc.name AS category, sum(ip.quantity) AS bricks \
-        FROM lego_inventories i \
-        JOIN lego_inventory_parts ip ON ip.inventory_id = i.id \
-        JOIN lego_parts pt ON pt.part_num = ip.part_num \
-        JOIN lego_part_categories pc ON pc.id = pt.part_cat_id \
-        WHERE i.version = 1 GROUP BY 1, 2) \
-    SELECT z.home_zone, k.category, sum(z.purchases)::bigint AS purchases, \
-           sum(z.purchases * k.bricks)::bigint AS bricks \
-    FROM z JOIN k ON k.set_num = z.set_num GROUP BY 1, 2 ORDER BY bricks DESC, 1, 2";
-
-/// `BY_ZONE_AND_CATEGORY` with `from` replaced by `to`.
-pub(crate) fn by_zone_and_category_with(from: &str, to: &str) -> String {
-    assert!(BY_ZONE_AND_CATEGORY.contains(from), "{from}");
-    BY_ZONE_AND_CATEGORY.replace(from, to)
-}

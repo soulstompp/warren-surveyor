@@ -44,7 +44,7 @@ mod writes;
 
 ::pgrx::pg_module_magic!(name, version);
 
-/// Installs warren-pg-speller's respelling, and loads the size of a WITH RECURSIVE query read while
+/// Installs warren-speller-pg's respelling, and loads the size of a WITH RECURSIVE query read while
 /// planning, a table's rows measured by its indexes, the statistics hooks, the round of planning
 /// that keeps what they measure, holds their reads to the statement's budget and weighs a
 /// statement's pages by its drives, the grouping at one value of a leading column, the price of a
@@ -54,7 +54,7 @@ mod writes;
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
-    warren_pg_speller::init();
+    warren_speller_pg::init();
     closure::init();
     size::init();
     leaves::init();
